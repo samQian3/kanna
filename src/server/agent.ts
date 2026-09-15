@@ -1392,7 +1392,6 @@ export class AgentCoordinator {
       }
 
       active.status = "waiting_for_user"
-      this.emitStateChange(args.chatId)
 
       return await new Promise<unknown>((resolve) => {
         active.pendingTool = {
@@ -1400,6 +1399,7 @@ export class AgentCoordinator {
           tool: request.tool,
           resolve,
         }
+        this.emitStateChange(args.chatId)
       })
     }
 
@@ -2316,6 +2316,15 @@ export class AgentCoordinator {
     const pending = active.pendingTool
     if (pending.toolUseId !== command.toolUseId) {
       throw new Error("Tool response does not match active request")
+    }
+
+    if (pending.tool.toolKind === "ask_user_question") {
+      const questions = pending.tool.input.questions
+      const answers = (command.result as { answers?: Record<string, unknown> } | null)?.answers
+      if (!answers || questions.some(question => {
+        const value = answers[question.id ?? question.question] ?? answers[question.question]
+        return !Array.isArray(value) || !value.some(answer => typeof answer === "string" && answer.trim())
+      })) throw new Error("请回答所有问题后再提交")
     }
 
     await this.store.appendMessage(

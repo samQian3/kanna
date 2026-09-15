@@ -1,3 +1,4 @@
+import { QuestionAlerts } from "./QuestionAlerts"
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { Navigate, Outlet, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom"
 import { Flower } from "lucide-react"
@@ -396,6 +397,7 @@ function KannaLayout() {
   return (
     <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden">
       {sidebarElement}
+      <QuestionAlerts />
       <Outlet context={state} />
       <SetupWizard />
       <CommandPalette state={state} />

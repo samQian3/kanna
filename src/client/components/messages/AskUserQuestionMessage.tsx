@@ -346,6 +346,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
 
   return (
     <div className="w-full space-y-3">
+      <p className="text-sm text-muted-foreground">等待你回答 · 提交前任务不会继续</p>
       <QuestionCard
         question={currentQuestion.question}
         currentIndex={currentIndex}
@@ -370,7 +371,8 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
               value={customInput}
               onChange={(e) => handleCustomInputChange(currentQuestion, e.target.value)}
               onKeyDown={handleCustomInputEnter}
-              placeholder="Other..."
+              aria-label="自定义回复"
+              placeholder="自定义回复：输入你的答案…"
               className="flex-1 px-3 !py-1 pl-4 min-h-[55px] min-w-0 text-sm bg-transparent outline-none text-foreground placeholder:text-muted-foreground"
             />
             <Checkbox
@@ -385,7 +387,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
       <div className="flex justify-end gap-2 mx-2">
         {!isLastQuestion && currentHasAnswer && (currentQuestion.multiSelect || !!customInput) && (
           <Button size="sm" onClick={handleNext}>
-            Next
+            下一题
           </Button>
         )}
         {isLastQuestion && (
@@ -395,7 +397,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
             disabled={!allQuestionsAnswered}
             className={cn(!allQuestionsAnswered && "opacity-50 cursor-not-allowed", "rounded-full")}
           >
-            Submit
+            提交答案
           </Button>
         )}
       </div>

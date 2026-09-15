@@ -705,7 +705,7 @@ export class CodexAppServerManager {
 
   constructor(args: { spawnProcess?: SpawnCodexAppServer } = {}) {
     this.spawnProcess = args.spawnProcess ?? ((cwd) =>
-      spawn("codex", ["app-server"], {
+      spawn("codex", ["--enable", "default_mode_request_user_input", "app-server"], {
         cwd,
         stdio: ["pipe", "pipe", "pipe"],
         env: process.env,
@@ -960,7 +960,7 @@ export class CodexAppServerManager {
             // Codex's instruction channel is per-turn, not per-session: this is
             // re-sent every turn by design. It appends to the built-in
             // developer message rather than replacing it.
-            developer_instructions: buildKannaAttributionInstructions(buildKannaAgentId("codex", args.model)),
+            developer_instructions: buildKannaAttributionInstructions(buildKannaAgentId("codex", args.model)) + "\nWhen a user decision or clarification is required, use request_user_input to present selectable options. Do not ask decision questions only as prose. Always allow a custom answer. Wait for the submitted answer before proceeding with any further work; do not treat a suggested option, silence, or elapsed time as consent.",
           },
         },
       } satisfies TurnStartParams)

@@ -1,3 +1,4 @@
+import { QuestionNotificationSetting } from "../QuestionAlerts"
 import { LocalAccessSection } from "./LocalAccessSection"
 import { useEffect, useState } from "react"
 import { Monitor, Moon, Sun } from "lucide-react"
@@ -243,6 +244,7 @@ export function GeneralSection({
   return (
     <>
       <LocalAccessSection />
+      <QuestionNotificationSetting />
       {appSettingsError ? <SettingsErrorBanner message={appSettingsError} /> : null}
       <div className="border-b border-border">
         <SettingsRow
