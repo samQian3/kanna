@@ -1334,7 +1334,7 @@ export class CodexAppServerManager {
         const status = ({started:"running",interacted:"running",completed:"completed",interrupted:"interrupted",failed:"failed"} as Record<string,string>)[item.kind]
         if (status) {
           pendingTurn.subagentStates ??= new Map()
-          for (const entry of updateChildStatus(pendingTurn.subagentStates,item.agentThreadId,item.agentPath,status)) pendingTurn.queue.push({type:"transcript",entry})
+          for (const entry of updateChildStatus(pendingTurn.subagentStates,item.agentThreadId,item.agentPath,status,typeof item.model === "string" ? item.model : undefined)) pendingTurn.queue.push({type:"transcript",entry})
         }
         return
       }
