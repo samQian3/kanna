@@ -5,7 +5,7 @@ export function updateChildStatus(states:Map<string,ChildState>, id:string, name
  const entries:TranscriptEntry[]=[];const terminal=['completed','failed','interrupted'].includes(status)
  if(!old||(!terminal&&['completed','failed','interrupted'].includes(old.status))){
   const state={name:name||old?.name||id.slice(0,8),toolId:`subagent:${id}:${crypto.randomUUID()}`,status};states.set(id,state)
-  entries.push({_id:crypto.randomUUID(),createdAt:Date.now(),kind:'tool_call',tool:{kind:'tool',toolKind:'subagent_task',toolName:'子代理',toolId:state.toolId,input:{subagentType:state.name, ...(model ? {model} : {})}}})
+  entries.push({_id:crypto.randomUUID(),createdAt:Date.now(),kind:'tool_call',tool:{kind:'tool',toolKind:'subagent_task',toolName:'子代理',toolId:state.toolId,input:{subagentType:state.name,agentThreadId:id, ...(model ? {model} : {})}}})
  }else {old.status=status;if(name)old.name=name}
  const state=states.get(id)!
  if(terminal)entries.push({_id:crypto.randomUUID(),createdAt:Date.now(),kind:'tool_result',toolId:state.toolId,content:`子代理 ${state.name}：${{completed:'已完成',failed:'失败',interrupted:'已中断'}[status]}`,isError:status!=='completed'})

@@ -22,18 +22,33 @@ export function collectSubagents(entries: TranscriptEntry[], active: boolean) {
   }
   return [...agents.values()]
 }
-export function SubagentPanel({entries, active}:{entries:TranscriptEntry[];active:boolean}) {
+export function SubagentPanel({entries, active, chatId}:{entries:TranscriptEntry[];active:boolean;chatId?:string|null}) {
   const [now,setNow]=useState(Date.now)
+  const [models,setModels]=useState<Record<string,string>>({})
+  const [open,setOpen]=useState(false)
+  const agentKey=entries.filter(entry=>entry.kind==="tool_call" && entry.tool.toolKind==="subagent_task").map(entry=>entry._id).join(",")
+  useEffect(()=>{setModels({})},[chatId])
+  useEffect(()=>{
+    if(!open||!chatId||!agentKey)return
+    let cancelled=false
+    const refresh=()=>fetch(`/api/chats/${encodeURIComponent(chatId)}/subagent-models`).then(response=>{
+      if(!response.ok)throw Error("Model lookup failed")
+      return response.json()
+    }).then(result=>{if(!cancelled)setModels(result.models??{})}).catch(()=>{})
+    void refresh()
+    const timer=setInterval(()=>void refresh(),60_000)
+    return()=>{cancelled=true;clearInterval(timer)}
+  },[open,chatId,agentKey])
   const agents=collectSubagents(entries,active)
   const running=agents.filter(a=>a.status==="运行中")
   useEffect(()=>{if(!running.length)return;const timer=setInterval(()=>setNow(Date.now()),1000);return()=>clearInterval(timer)},[running.length])
-  return <Popover><PopoverTrigger asChild><button type="button" aria-label={`子代理状态，${running.length} 个运行中`} className="flex shrink-0 items-center gap-1 rounded-lg p-2 text-muted-foreground hover:bg-muted"><Network size={18}/><span className="text-xs tabular-nums">{running.length}</span></button></PopoverTrigger>
+  return <Popover open={open} onOpenChange={setOpen}><PopoverTrigger asChild><button type="button" aria-label={`子代理状态，${running.length} 个运行中`} className="flex shrink-0 items-center gap-1 rounded-lg p-2 text-muted-foreground hover:bg-muted"><Network size={18}/><span className="text-xs tabular-nums">{running.length}</span></button></PopoverTrigger>
     <PopoverContent side="top" align="end" className="w-[min(400px,calc(100vw-24px))] p-4">
       <div className="mb-3 flex items-center justify-between"><strong>子代理</strong><span className="text-xs text-muted-foreground">{running.length} 个运行中</span></div>
       {!agents.length ? <p className="text-sm text-muted-foreground">当前任务暂无子代理记录</p> : <div className="max-h-72 overflow-y-auto space-y-3">{[...agents].sort((a,b)=>Number(b.status==="运行中")-Number(a.status==="运行中")).map(agent=><div key={agent.id} className="rounded-xl border p-3 text-sm">
         <div className="flex justify-between gap-2"><span className="truncate font-medium">{agent.name}</span><span className="shrink-0 text-xs text-muted-foreground">{agent.status}</span></div>
-        <div className="mt-2 flex justify-between gap-2 text-xs text-muted-foreground"><span>模型：{agent.model}</span><span className="shrink-0 tabular-nums">{agent.status==="状态未确认" ? "时长未确认" : formatTurnDuration((agent.endedAt??now)-agent.startedAt)}</span></div>
+        <div className="mt-2 flex justify-between gap-2 text-xs text-muted-foreground"><span>模型：{agent.model !== "未提供" ? agent.model : models[agent.id] ?? "未提供"}</span><span className="shrink-0 tabular-nums">{agent.status==="状态未确认" ? "时长未确认" : formatTurnDuration((agent.endedAt??now)-agent.startedAt)}</span></div>
       </div>)}</div>}
-      <p className="mt-3 text-xs text-muted-foreground">显示已加载的任务记录；模型未返回时标为“未提供”。</p>
+      <p className="mt-3 text-xs text-muted-foreground">模型来自子代理配置；无法读取时显示“未提供”。</p>
     </PopoverContent></Popover>
 }
