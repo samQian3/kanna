@@ -1,3 +1,4 @@
+import { updateChildStatus, type ChildState } from './codex-subagent-status'
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
@@ -89,6 +90,7 @@ interface PendingRequest<TResult> {
 }
 
 interface PendingTurn {
+  subagentStates?: Map<string,ChildState>
   turnId: string | null
   model: string
   planMode: boolean
@@ -1290,6 +1292,21 @@ export class CodexAppServerManager {
   }
 
   private async handleNotification(context: SessionContext, notification: ServerNotification) {
+    // Child agents share the app-server transport, but not this chat's lifecycle.
+    const params = notification.params as unknown as { threadId?: string; thread?: { id?: string }; turnId?: string; turn?: { id?: string } }
+    const eventThreadId = params.threadId ?? (notification.method === "thread/started" ? params.thread?.id : undefined)
+    if (context.sessionToken && eventThreadId && eventThreadId !== context.sessionToken) {
+      const pending = context.pendingTurn
+      if (pending?.subagentStates?.has(eventThreadId) && notification.method === "turn/completed") {
+        const status = (notification.params as any).turn.status
+        if (["completed", "failed", "interrupted"].includes(status)) {
+          for (const entry of updateChildStatus(pending.subagentStates, eventThreadId, undefined, status)) pending.queue.push({type:"transcript",entry})
+        }
+      }
+      return
+    }
+    const eventTurnId = params.turnId ?? (notification.method === "turn/completed" ? params.turn?.id : undefined)
+    if (context.pendingTurn?.turnId && eventTurnId && eventTurnId !== context.pendingTurn.turnId) return
     if (notification.method === "thread/started") {
       context.sessionToken = notification.params.thread.id
       if (context.pendingTurn) {
@@ -1311,6 +1328,17 @@ export class CodexAppServerManager {
     const pendingTurn = context.pendingTurn
     if (!pendingTurn) return
 
+    if (notification.method === "item/started" || notification.method === "item/completed") {
+      const item = (notification.params as any).item
+      if (item?.type === "subAgentActivity" && typeof item.agentThreadId === "string") {
+        const status = ({started:"running",interacted:"running",completed:"completed",interrupted:"interrupted",failed:"failed"} as Record<string,string>)[item.kind]
+        if (status) {
+          pendingTurn.subagentStates ??= new Map()
+          for (const entry of updateChildStatus(pendingTurn.subagentStates,item.agentThreadId,item.agentPath,status)) pendingTurn.queue.push({type:"transcript",entry})
+        }
+        return
+      }
+    }
     switch (notification.method) {
       case "thread/tokenUsage/updated":
         this.handleTokenUsageUpdated(pendingTurn, notification.params)

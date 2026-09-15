@@ -185,6 +185,7 @@ export type ClientCommand =
     }
   | { type: "chat.create"; projectId: string }
   | { type: "chat.fork"; chatId: string }
+  | { type: "chat.editPrevious"; chatId: string; messageId: string }
   | { type: "chat.rename"; chatId: string; title: string }
   | { type: "chat.archive"; chatId: string }
   | { type: "chat.unarchive"; chatId: string }

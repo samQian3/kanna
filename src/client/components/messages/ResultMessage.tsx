@@ -1,4 +1,5 @@
 import type { ProcessedResultMessage } from "./types"
+import { useTranscriptRenderOptions } from "./render-context"
 import { MetaRow, MetaLabel } from "./shared"
 
 interface Props {
@@ -62,6 +63,8 @@ export function formatDuration(ms: number): string {
 }
 
 export function ResultMessage({ message, nextPromptTimestamp }: Props) {
+  const options = useTranscriptRenderOptions()
+  if (message.success && options.turnTiming) return null
   if (!message.success) {
     return (
       <div className="px-4 py-3 mx-2 my-1 rounded-lg bg-destructive/10 border border-destructive/20 text-destructive text-sm">

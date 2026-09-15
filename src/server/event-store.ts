@@ -1146,6 +1146,20 @@ export class EventStore {
     return this.state.chatsById.get(chatId)!
   }
 
+  async branchBeforeLastPrompt(sourceChatId: string, messageId: string) {
+    const source = this.requireChat(sourceChatId)
+    const entries = this.getMessages(sourceChatId)
+    const index = entries.findIndex(entry => entry._id === messageId && entry.kind === "user_prompt")
+    if (index < 0 || entries.slice(index + 1).some(entry => entry.kind === "user_prompt")) throw new Error("Only the latest user message can be edited. Refresh and try again.")
+    const chat = await this.createChat(source.projectId)
+    if (source.provider) await this.setChatProvider(chat.id, source.provider)
+    await this.setPlanMode(chat.id, source.planMode)
+    await this.renameChat(chat.id, `${source.title} · 修订`)
+    await copyTranscriptMedia(this.dataDir, sourceChatId, chat.id)
+    for (const entry of entries.slice(0,index)) await this.appendMessage(chat.id,retargetEntryMediaUrls(entry,sourceChatId,chat.id))
+    return {chatId:chat.id}
+  }
+
   async forkChat(sourceChatId: string) {
     const sourceChat = this.requireChat(sourceChatId)
     const sourceSessionToken = sourceChat.sessionToken ?? sourceChat.pendingForkSessionToken ?? null

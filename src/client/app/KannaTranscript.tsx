@@ -514,7 +514,7 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   let rendered: React.ReactNode = null
 
   if (message.kind === "user_prompt") {
-    rendered = <UserMessage key={message.id} content={message.content} attachments={message.attachments} steered={message.steered} flash={flash} />
+    rendered = <UserMessage key={message.id} id={message.id} timestamp={message.timestamp} content={message.content} attachments={message.attachments} steered={message.steered} flash={flash} />
   } else {
     switch (message.kind) {
       case "unknown":

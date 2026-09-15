@@ -1360,7 +1360,7 @@ export class AgentCoordinator {
     // and prepend the rebuilt context on the wire. Runs before the user prompt
     // is appended so the boundary precedes it, mirroring the handoff ordering.
     const restore = !handoff && previousProvider !== null
-      && await this.detectLostProviderSession({
+      && ((!chat.sessionToken && !chat.pendingForkSessionToken && existingMessages.length > 0) || await this.detectLostProviderSession({
         chatId: args.chatId,
         provider: args.provider,
         cwd: project.localPath,
@@ -1368,7 +1368,7 @@ export class AgentCoordinator {
         serviceTier: args.serviceTier,
         sessionToken: chat.sessionToken,
         pendingForkSessionToken: chat.pendingForkSessionToken,
-      })
+      }))
       ? await this.prepareSessionRestore(args.chatId, args.provider, existingMessages)
       : null
 

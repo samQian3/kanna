@@ -686,3 +686,10 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Chat conversation typography, scoped to message content. */
+.kanna-assistant-message { font-size: 16px; line-height: 1.85; }
+.kanna-assistant-message p { margin-top: 0.8em; margin-bottom: 0.8em; }
+.kanna-user-bubble { font-size: 16px; line-height: 1.65; }
+.kanna-user-bubble :where(p,a,strong,code) { color: inherit; }
+@media (max-width: 640px) { .kanna-user-bubble,.kanna-assistant-message { font-size: 15px; } }

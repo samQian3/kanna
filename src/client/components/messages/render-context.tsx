@@ -2,6 +2,10 @@ import { createContext, useContext, type ReactNode } from "react"
 import type { StandaloneTranscriptAttachmentMode } from "../../../shared/types"
 
 export interface TranscriptRenderOptions {
+  turnTiming?: Record<string, import("./turnTiming").TurnTiming>
+  replyTimes?: Record<string, number>
+  editableMessageId?: string
+  onEditMessage?: (id:string, content:string, attachments: import("../../../shared/types").ChatAttachment[]) => Promise<void>
   readonly: boolean
   localLinkMode: "open" | "text"
   attachmentMode: "live" | StandaloneTranscriptAttachmentMode

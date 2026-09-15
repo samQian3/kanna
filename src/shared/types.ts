@@ -601,6 +601,14 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
     supportsAutoPlanMode: false,
     models: [
       {
+        id: "gpt-6-astra",
+        label: "GPT-6 Astra",
+        supportsEffort: true,
+        supportedReasoningEfforts: GPT_5_6_REASONING_OPTIONS,
+        defaultReasoningEffort: "medium",
+        supportsFastMode: true,
+      },
+      {
         id: "gpt-5.6-sol",
         label: "GPT-5.6 Sol",
         supportsEffort: true,

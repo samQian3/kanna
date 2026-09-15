@@ -1392,6 +1392,14 @@ export function createWsRouter({
           })
           return
         }
+        case "chat.editPrevious": {
+          const status = agent.getActiveStatuses().get(command.chatId)
+          if (status === "running" || status === "starting" || status === "waiting_for_user") throw new Error("Wait for the current task to finish before editing.")
+          const result = await store.branchBeforeLastPrompt(command.chatId,command.messageId)
+          send(ws,{v:PROTOCOL_VERSION,type:"ack",id,result})
+          await broadcastFilteredSnapshots({includeSidebar:true,includeLocalProjects:true})
+          return
+        }
         case "chat.fork": {
           const result = await agent.forkChat(command.chatId)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })

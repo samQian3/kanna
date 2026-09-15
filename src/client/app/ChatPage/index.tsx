@@ -1,6 +1,8 @@
+import { buildTurnTiming } from "../../components/messages/turnTiming"
+import { useChatInputStore } from "../../stores/chatInputStore"
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties, type DragEvent, type ReactNode, type RefObject } from "react"
 import type { GroupImperativeHandle } from "react-resizable-panels"
-import { useOutletContext } from "react-router-dom"
+import { useNavigate, useOutletContext } from "react-router-dom"
 import type { ChatInputHandle } from "../../components/chat-ui/ChatInput"
 import { ChatNavbar } from "../../components/chat-ui/ChatNavbar"
 import { BrowserPanel } from "../../components/chat-ui/BrowserPanel"
@@ -851,7 +853,17 @@ export function ChatPage() {
     [state.socket, state.activeChatId]
   )
 
-  const transcriptRenderOptions = useMemo(() => ({ loadEntryDebugRaw }), [loadEntryDebugRaw])
+  const navigateToEditedChat = useNavigate()
+  const lastPrompt = [...(state.chatSnapshot?.messages ?? [])].reverse().find(entry => entry.kind === "user_prompt")
+  const onEditMessage = useCallback(async (id:string,content:string,attachments:import("../../../shared/types").ChatAttachment[]) => {
+    if (!state.activeChatId) return
+    const result = await state.socket.command<{chatId:string}>({type:"chat.editPrevious",chatId:state.activeChatId,messageId:id})
+    useChatInputStore.getState().setDraft(result.chatId,content)
+    useChatInputStore.getState().setAttachmentDrafts(result.chatId,attachments)
+    navigateToEditedChat(`/chat/${result.chatId}`)
+  },[state.activeChatId,state.socket,navigateToEditedChat])
+  const timing = useMemo(() => buildTurnTiming(state.chatSnapshot?.messages ?? [], state.canCancel), [state.chatSnapshot?.messages, state.canCancel])
+  const transcriptRenderOptions = useMemo(() => ({ loadEntryDebugRaw,turnTiming:timing.turns,replyTimes:timing.replyTimes,editableMessageId:state.canCancel?undefined:lastPrompt?._id,onEditMessage }), [loadEntryDebugRaw,timing,state.canCancel,lastPrompt?._id,onEditMessage])
 
   // One cache per chat: entry ids are chat-scoped, and leaving a chat should
   // not keep its payloads resident.

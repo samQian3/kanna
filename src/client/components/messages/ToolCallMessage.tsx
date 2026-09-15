@@ -62,10 +62,11 @@ export function ToolCallMessage({ message, isLoading = false, localPath }: Props
     }
     if (message.toolKind === "subagent_task") {
       const agent = message.input.subagentType || message.toolName
-      return message.input.description ? `${agent}: ${message.input.description}` : agent
+      const label = message.input.description ? `${agent}: ${message.input.description}` : agent
+      return `${label} · ${hasResult ? (message.isError ? "失败 / 已中断" : "已完成") : (isLoading ? "运行中" : "等待状态更新")}`
     }
     return message.toolName
-  }, [message.input, message.toolName, localPath])
+  }, [message.input, message.toolName, localPath, hasResult, message.isError, isLoading])
 
   const isAgent = message.toolKind === "subagent_task"
 
