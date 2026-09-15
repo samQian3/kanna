@@ -12,6 +12,7 @@ export interface AuthManager {
   validateOrigin(req: Request): boolean
   redirectToApp(req: Request): Response
   handleLogin(req: Request, nextPath: string): Promise<Response>
+  handleTokenLogin(req: Request, token: string): Promise<Response>
   handleLogout(req: Request): Response
   handleStatus(req: Request): Response
 }
@@ -183,6 +184,17 @@ export function createAuthManager(password: string, options: AuthManagerOptions 
     return response
   }
 
+  async function handleTokenLogin(req: Request, token: string) {
+    if (!validateOrigin(req)) return Response.json({ error: "Forbidden" }, { status: 403 })
+    let candidate: unknown
+    try { candidate = (await req.json()).token } catch { return Response.json({ error: "Invalid request" }, { status: 400 }) }
+    if (typeof candidate !== "string" || candidate.length > 256) return Response.json({ error: "Invalid token" }, { status: 401 })
+    const actual = Buffer.from(candidate)
+    const expected = Buffer.from(token)
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return Response.json({ error: "Invalid token" }, { status: 401 })
+    return Response.json({ ok: true }, { headers: { "Set-Cookie": createSessionCookie(req), "Cache-Control": "no-store" } })
+  }
+
   function handleLogout(req: Request) {
     if (!validateOrigin(req)) {
       return Response.json({ error: "Forbidden" }, { status: 403 })
@@ -198,6 +210,7 @@ export function createAuthManager(password: string, options: AuthManagerOptions 
     validateOrigin,
     redirectToApp,
     handleLogin,
+    handleTokenLogin,
     handleLogout,
     handleStatus,
   }

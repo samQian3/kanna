@@ -1,3 +1,4 @@
+import { createLocalAccess, localAccessUrls, TOKEN_LOGIN_HTML } from "./local-access"
 import path from "node:path"
 import { stat } from "node:fs/promises"
 import { APP_NAME, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
@@ -150,6 +151,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   /** Only set when *this* process paired; the CLI owns a handed-in runtime. */
   let selfPairedCloud: CloudRuntime | null = null
   await store.initialize()
+  const localAccess = options.password ? await createLocalAccess(store.dataDir, options.password) : null
   await diffStore.initialize()
   await store.migrateLegacyTranscripts(options.onMigrationProgress)
   // Not awaited: this streams every transcript once per data dir, which on a
@@ -472,6 +474,29 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
               return withOriginAgentCluster(new Response("Unauthorized", { status: 401 }))
             }
             return withOriginAgentCluster(new Response("Not found", { status: 404 }))
+          }
+
+          if (url.pathname === "/auth/link" && req.method === "GET" && requestClass === "local") {
+            return new Response(TOKEN_LOGIN_HTML, { headers: {
+              "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+              "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+            } })
+          }
+          if (url.pathname === "/auth/token") {
+            if (req.method !== "POST") return new Response(null, { status: 405 })
+            if (requestClass !== "local" || !auth || !localAccess) return new Response(null, { status: 403 })
+            return auth.handleTokenLogin(req, localAccess.token())
+          }
+          if (url.pathname === "/api/local-access") {
+            if (requestClass !== "local" || (auth && (!auth.isAuthenticated(req) || !auth.validateOrigin(req)))) return new Response(null, { status: 403 })
+            if (req.method === "POST" && localAccess) await localAccess.rotate()
+            else if (req.method !== "GET") return new Response(null, { status: 405 })
+            const origins = localAccessUrls(hostname, actualPort)
+            return Response.json({ host: hostname, port: actualPort,
+              scope: ["127.0.0.1", "localhost", "::1"].includes(hostname) ? "localhost" : "lan",
+              links: origins.map(origin => localAccess ? `${origin}/auth/link#token=${localAccess.token()}` : origin),
+              tokenEnabled: !!localAccess,
+            }, { headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" } })
           }
 
           if (url.pathname === "/auth/status") {

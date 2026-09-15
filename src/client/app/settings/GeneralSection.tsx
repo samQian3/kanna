@@ -1,3 +1,4 @@
+import { LocalAccessSection } from "./LocalAccessSection"
 import { useEffect, useState } from "react"
 import { Monitor, Moon, Sun } from "lucide-react"
 import { ANALYTICS_STATIC_EVENT_NAMES, ANALYTICS_STATIC_PROPERTY_NAMES } from "../../../shared/analytics"
@@ -241,6 +242,7 @@ export function GeneralSection({
 
   return (
     <>
+      <LocalAccessSection />
       {appSettingsError ? <SettingsErrorBanner message={appSettingsError} /> : null}
       <div className="border-b border-border">
         <SettingsRow
