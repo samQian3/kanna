@@ -21,6 +21,8 @@ import {
   type AccountRateLimitsUpdatedNotification,
   type CollabAgentToolCallItem,
   type ContextCompactedNotification,
+  type CodexError,
+  type ErrorNotification,
   type CodexModelSummary,
   type CodexRateLimitSnapshot,
   type CodexRequestId,
@@ -90,6 +92,7 @@ interface PendingRequest<TResult> {
 }
 
 interface PendingTurn {
+  retryCause: CodexError | null
   subagentStates?: Map<string,ChildState>
   turnId: string | null
   model: string
@@ -182,6 +185,44 @@ function codexSystemInitEntry(model: string): TranscriptEntry {
 function errorMessage(value: unknown): string {
   if (value instanceof Error) return value.message
   return String(value)
+}
+
+function errorDetail(error: CodexError): string {
+  const info = error.codexErrorInfo
+  if (typeof info === "string") return info.trim()
+  if (!info || typeof info !== "object") return ""
+  const [kind, data] = Object.entries(info)[0] ?? []
+  if (!kind) return ""
+  const status = data?.httpStatusCode
+  return typeof status === "number" ? `${kind} (HTTP ${status})` : kind
+}
+
+/**
+ * codex splits an error across `message` and `codexErrorInfo`, and the message
+ * on its own is often just a summary. Keep both when the detail adds anything,
+ * so a failed turn names the cause rather than the category.
+ */
+function formatCodexError(error: CodexError | null | undefined): string {
+  if (!error) return ""
+  const message = error.message?.trim() ?? ""
+  const detail = errorDetail(error)
+  if (!detail || message.includes(detail)) return message
+  return message ? `${message}: ${detail}` : detail
+}
+
+/**
+ * Of the errors in one retry sequence, keep the one that explains the most.
+ * codex mixes a cause ("stream disconnected: unexpected EOF") in with bare
+ * progress notices ("Reconnecting... 2/5") and the order isn't guaranteed —
+ * the sequences in the wild open with a counter — so neither "first wins" nor
+ * "last wins" reliably holds the cause. Prefer whichever carries
+ * `codexErrorInfo`, and otherwise keep the first: letting a counter overwrite
+ * a real cause is the exact failure this fallback exists to prevent.
+ */
+function preferredRetryCause(current: CodexError | null, next: CodexError): CodexError {
+  if (!current) return next
+  if (errorDetail(next) && !errorDetail(current)) return next
+  return current
 }
 
 function parseJsonLine(line: string): unknown | null {
@@ -956,6 +997,7 @@ export class CodexAppServerManager {
       todoSequence: 0,
       pendingWebSearchResultToolId: null,
       resolved: false,
+      retryCause: null,
       onToolRequest: args.onToolRequest,
       onApprovalRequest: args.onApprovalRequest,
     }
@@ -1391,7 +1433,7 @@ export class CodexAppServerManager {
         this.handleContextCompacted(pendingTurn, notification.params)
         return
       case "error":
-        this.failContext(context, notification.params.error.message)
+        this.handleErrorNotification(context, notification.params)
         return
       default:
         return
@@ -1584,11 +1626,29 @@ export class CodexAppServerManager {
         subtype: isCancelled ? "cancelled" : isError ? "error" : "success",
         isError,
         durationMs: 0,
-        result: notification.turn.error?.message ?? "",
+        result: isError
+          ? formatCodexError(notification.turn.error) || formatCodexError(pendingTurn.retryCause) || "Codex turn failed"
+          : formatCodexError(notification.turn.error),
       }),
     })
     pendingTurn.queue.finish()
     context.pendingTurn = null
+  }
+
+  private handleErrorNotification(context: SessionContext, notification: ErrorNotification) {
+    const message = formatCodexError(notification.error) || "Codex reported an error"
+    if (!notification.willRetry) {
+      this.failContext(context, message)
+      return
+    }
+
+    const pendingTurn = context.pendingTurn
+    if (!pendingTurn || pendingTurn.resolved) return
+    pendingTurn.retryCause = preferredRetryCause(pendingTurn.retryCause, notification.error)
+    pendingTurn.queue.push({
+      type: "transcript",
+      entry: timestamped({ kind: "status", status: message }),
+    })
   }
 
   private failContext(context: SessionContext, message: string) {
