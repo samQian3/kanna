@@ -1,3 +1,4 @@
+import { recordClientPerformance, startClientPerformance } from "./clientPerformance"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { useShallow } from "zustand/react/shallow"
@@ -6,6 +7,7 @@ import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "../stores/chatPre
 import { useRightSidebarStore } from "../stores/rightSidebarStore"
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore"
 import { getEditorPresetLabel, useTerminalPreferencesStore } from "../stores/terminalPreferencesStore"
+import { useEffectiveEditorPreset } from "../components/open-external-menu"
 import { useChatInputStore } from "../stores/chatInputStore"
 import {
   findSidebarChat,
@@ -46,6 +48,7 @@ import {
   cachedWindowToMessages,
   createTranscriptCacheWriter,
   readCachedWindow,
+  readMemoryCachedWindow,
   type CachedTranscriptWindow,
 } from "./chatTranscriptCache"
 import { DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES, trimTranscriptWindow } from "../../shared/transcript-window"
@@ -57,7 +60,7 @@ import { useChatReadAnchor, type ChatReadAnchorState, type ReadAnchorLayoutSourc
 import { useSendMessage } from "./useSendMessage"
 import { useShareExport } from "./useShareExport"
 import { useUpdateRestart } from "./useUpdateRestart"
-import type { EditorOpenSettings, OpenExternalAction } from "../../shared/protocol"
+import type { EditorOpenSettings, OpenExternalAction, TerminalPreset } from "../../shared/protocol"
 
 export {
   getUiUpdateReadinessPath,
@@ -92,13 +95,6 @@ const EMPTY_OUTLINE: TranscriptOutlineEntry[] = []
 // per render failed its shallow compare and re-rendered the whole viewport on
 // every push.
 const EMPTY_QUEUED_MESSAGES: ChatSnapshot["queuedMessages"] = []
-
-/**
- * How long to wait for the local transcript cache before subscribing without
- * it. Generous next to a healthy read and still short enough that a stalled
- * one is not something you sit and look at.
- */
-const CACHED_WINDOW_READ_BUDGET_MS = 250
 
 function sameOriginWsUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
@@ -235,6 +231,7 @@ export interface KannaState {
   handleRenameChat: (chat: SidebarChatRow) => Promise<void>
   handleRenameProject: (projectId: string, sidebarTitle: string | undefined, realTitle: string) => Promise<void>
   handleShareChat: (chatId?: string | null) => Promise<void>
+  handleToggleChatPin: (chat: SidebarChatRow) => Promise<void>
   handleArchiveChat: (chat: SidebarChatRow) => Promise<void>
   handleOpenArchivedChat: (chatId: string) => Promise<void>
   handleRestoreChat: (chatId: string) => Promise<void>
@@ -243,7 +240,7 @@ export interface KannaState {
   handleHideProject: (projectId: string) => Promise<void>
   handleReorderProjectGroups: (projectIds: string[]) => Promise<void>
   handleCopyPath: (localPath: string) => Promise<void>
-  handleOpenExternal: (action: OpenExternalAction, editor?: EditorOpenSettings) => Promise<void>
+  handleOpenExternal: (action: OpenExternalAction, editor?: EditorOpenSettings, terminal?: TerminalPreset) => Promise<void>
   handleOpenExternalPath: (action: "open_finder" | "open_editor", localPath: string) => Promise<void>
   handleOpenLocalLink: (target: OpenLocalLinkTarget, action?: OpenExternalAction, editor?: EditorOpenSettings) => Promise<void>
   handleCompose: () => void
@@ -272,6 +269,10 @@ export function useKannaState(activeChatId: string | null): KannaState {
 
   const [localProjects, setLocalProjects] = useState<LocalProjectsSnapshot | null>(null)
   const [chatSnapshot, setChatSnapshot] = useState<ChatSnapshot | null>(null)
+  const [cachedTranscript, setCachedTranscript] = useState<CachedTranscriptWindow | null>(null)
+  const openTiming = useRef({ chatId: activeChatId, started: performance.now(), displayed: false })
+  if (openTiming.current.chatId !== activeChatId) openTiming.current = { chatId: activeChatId, started: performance.now(), displayed: false }
+  useEffect(() => startClientPerformance(() => socket.getResourceCounts()), [socket])
   const transcriptCacheWriter = useMemo(() => createTranscriptCacheWriter(), [])
   const [projectDiffSnapshots, setProjectDiffSnapshots] = useState<Record<string, ChatDiffSnapshot | null>>({})
   const [connectionStatus, setConnectionStatus] = useState<SocketStatus>("connecting")
@@ -293,7 +294,12 @@ export function useKannaState(activeChatId: string | null): KannaState {
     projectId: null,
     diffs: null,
   })
-  const editorLabel = getEditorPresetLabel(useTerminalPreferencesStore((store) => store.editorPreset))
+  // Not the raw preference: every plain "Open in X" in the app names the
+  // editor the navbar button would open, which is the one you last picked
+  // there and never one this machine doesn't have.
+  const editorLabel = getEditorPresetLabel(
+    useEffectiveEditorPreset(useTerminalPreferencesStore((store) => store.editorPreset))
+  )
 
   useEffect(() => socket.onStatus(setConnectionStatus), [socket])
 
@@ -397,11 +403,14 @@ export function useKannaState(activeChatId: string | null): KannaState {
     }
 
     setChatSnapshot(null)
+    setCachedTranscript(null)
     setChatReady(false)
 
     // Narrowed once for the closures below, which lose it otherwise.
     const chatId = activeChatId
     let cancelled = false
+    let receivedSnapshot = false
+    const openedAt = performance.now()
     let unsubscribe: (() => void) | null = null
     // Base for the first incremental push: the server resumes from the cached
     // span, so its first body starts where this window ends rather than
@@ -409,6 +418,10 @@ export function useKannaState(activeChatId: string | null): KannaState {
     let base: { messages: TranscriptEntry[]; startIndex: number } | null = null
 
     function handleSnapshot(snapshot: ChatSnapshot | null) {
+      if (cancelled) return
+      if (!receivedSnapshot) recordClientPerformance("chat_server_ready_ms", performance.now() - openedAt)
+      receivedSnapshot = true
+      setCachedTranscript(null)
       // `foldChatSnapshot` is pure by contract — see its comment. Keep this
       // updater a bare call to it and nothing else; the last thing that folded
       // inline also cleared `base` as it went, and React re-running the updater
@@ -433,7 +446,11 @@ export function useKannaState(activeChatId: string | null): KannaState {
       const span = trimmed && lastEntryId
         ? { start: trimmed.startIndex, end: trimmed.startIndex + trimmed.messages.length, endEntryId: lastEntryId }
         : null
-      if (trimmed && span) base = trimmed
+      if (trimmed && span) {
+        base = trimmed
+        setCachedTranscript({ ...cached!, entries: trimmed.messages, startIndex: trimmed.startIndex })
+        recordClientPerformance("chat_cache_ready_ms", performance.now() - openedAt)
+      }
       // The server sizes the window (the transcript-window setting, widened
       // to reach the stored read anchor) and returns the anchor inline.
       unsubscribe = socket.subscribe<ChatSnapshot | null>(
@@ -454,21 +471,18 @@ export function useKannaState(activeChatId: string | null): KannaState {
       )
     }
 
-    // The cache read only decides where the server should resume from, so it
-    // must never be what the transcript is waiting on. It normally takes a few
-    // milliseconds, but IndexedDB is a shared queue: a read issued just as the
-    // cache writer puts a large window can sit behind it, and nothing has even
-    // been asked of the server until it comes back. Past the deadline we
-    // subscribe cold and take the full window — more bytes, but it arrives.
-    const cacheDeadline = window.setTimeout(() => subscribeToChat(null), CACHED_WINDOW_READ_BUDGET_MS)
-    void readCachedWindow(chatId).then((cached) => {
-      window.clearTimeout(cacheDeadline)
-      subscribeToChat(cached)
+    // Memory can seed a resumed subscription. Disk reads never delay the request.
+    const memory = readMemoryCachedWindow(chatId)
+    subscribeToChat(memory)
+    if (!memory) void readCachedWindow(chatId).then(cached => {
+      if (cancelled || receivedSnapshot || !cached) return
+      const trimmed = trimTranscriptWindow(cachedWindowToMessages(cached), transcriptWindowSizeRef.current)
+      setCachedTranscript({ ...cached, entries: trimmed.messages, startIndex: trimmed.startIndex })
+      recordClientPerformance("chat_cache_ready_ms", performance.now() - openedAt)
     })
 
     return () => {
       cancelled = true
-      window.clearTimeout(cacheDeadline)
       unsubscribe?.()
       // A chat closed mid-turn never reaches a settled write, so take what is
       // pending rather than lose the window.
@@ -588,7 +602,21 @@ export function useKannaState(activeChatId: string | null): KannaState {
 
     return unsubscribe
   }, [activeProjectId, socket])
-  const serverTranscriptEntries = activeChatSnapshot?.messages ?? EMPTY_TRANSCRIPT_ENTRIES
+  const serverTranscriptEntries = activeChatSnapshot?.messages
+    ?? (cachedTranscript?.chatId === activeChatId ? cachedTranscript.entries : EMPTY_TRANSCRIPT_ENTRIES)
+  useEffect(() => {
+    const timing = openTiming.current
+    if (!activeChatId || !serverTranscriptEntries.length || timing.displayed || document.visibilityState !== "visible") return
+    let secondFrame = 0
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        if (openTiming.current !== timing) return
+        timing.displayed = true
+        recordClientPerformance("chat_display_ms", performance.now() - timing.started)
+      })
+    })
+    return () => { cancelAnimationFrame(firstFrame); cancelAnimationFrame(secondFrame) }
+  }, [activeChatId, serverTranscriptEntries])
   const optimisticScopeId = activeChatId ?? NEW_CHAT_OPTIMISTIC_SCOPE
   const optimisticTranscriptEntries = useMemo(
     () => optimisticUserPrompts
@@ -604,7 +632,10 @@ export function useKannaState(activeChatId: string | null): KannaState {
   // only the new ones. See `processTranscriptMessages` for the prefix rule.
   const previousMessagesRef = useRef<HydratedTranscriptMessage[] | null>(null)
   const messages = useMemo(() => {
+    const started = performance.now()
     const next = processTranscriptMessages(transcriptEntries, previousMessagesRef.current)
+    recordClientPerformance("transcript_hydrate_ms", performance.now() - started)
+    recordClientPerformance("transcript_entries", transcriptEntries.length)
     previousMessagesRef.current = next
     return next
   }, [transcriptEntries])
@@ -631,7 +662,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
   // Written after a turn settles, not during: the window changes many times a
   // second while streaming and the server is the source of truth throughout.
   useEffect(() => {
-    if (!activeChatId || !chatSnapshot) return
+    if (!activeChatId || !chatSnapshot || chatSnapshot.runtime.chatId !== activeChatId) return
     transcriptCacheWriter.schedule(activeChatId, chatSnapshot, isProcessing)
   }, [activeChatId, chatSnapshot, isProcessing, transcriptCacheWriter])
 
@@ -834,6 +865,15 @@ export function useKannaState(activeChatId: string | null): KannaState {
       setCommandError(error instanceof Error ? error.message : String(error))
     }
   }, [activeChatId, dialog, navigate, socket])
+
+  const handleToggleChatPin = useCallback(async (chat: SidebarChatRow) => {
+    try {
+      await socket.command({ type: "chat.setPinned", chatId: chat.chatId, pinned: !chat.pinnedAt })
+      setCommandError(null)
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error))
+    }
+  }, [socket])
 
   const handleArchiveChat = useCallback(async (chat: SidebarChatRow) => {
     try {
@@ -1047,6 +1087,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
     handleRenameChat,
     handleRenameProject,
     handleShareChat,
+    handleToggleChatPin,
     handleArchiveChat,
     handleOpenArchivedChat,
     handleRestoreChat,

@@ -43,12 +43,12 @@ async function deploy(){
     if(current!==hash)throw Error('Installed file changed after staging: '+file);
   }
   const backup=path.join(root,'backup');
-  for(const file of Object.keys(manifest).filter(f=>f.startsWith('src/'))){const p=path.join(installed,file);if(fs.existsSync(p)){fs.mkdirSync(path.dirname(path.join(backup,file)),{recursive:true});fs.copyFileSync(p,path.join(backup,file));}}
+  for(const file of Object.keys(manifest).filter(f=>f.startsWith('src/') || f==='package.json')){const p=path.join(installed,file);if(fs.existsSync(p)){fs.mkdirSync(path.dirname(path.join(backup,file)),{recursive:true});fs.copyFileSync(p,path.join(backup,file));}}
   for(const dir of ['dist/client','dist/export-viewer'])fs.cpSync(path.join(installed,dir),path.join(backup,dir),{recursive:true});
   // Recheck after backups; do not activate while any task is active.
   const busy=await inspectIdle();if(busy.length)return false;
   status('deploying');
-  for(const file of Object.keys(manifest).filter(f=>f.startsWith('src/')))fs.copyFileSync(path.join(root,'payload',file),path.join(installed,file));
+  for(const file of Object.keys(manifest).filter(f=>f.startsWith('src/') || f==='package.json')){fs.mkdirSync(path.dirname(path.join(installed,file)),{recursive:true});fs.copyFileSync(path.join(root,'payload',file),path.join(installed,file));}
   for(const dir of ['dist/client','dist/export-viewer'])fs.cpSync(path.join(root,'payload',dir),path.join(installed,dir),{recursive:true});
   restart();
   for(let i=0;i<30;i++){await sleep(1000);try{const r=await fetch(base+'/health',{signal:AbortSignal.timeout(2000)});if(r.ok){const html=await(await fetch(base)).text();const expected=fs.readFileSync(path.join(root,'payload/dist/client/index.html'),'utf8');const asset=expected.match(/src="([^"]+\.js)"/)[1];if(html.includes(asset)){status('complete',{asset, ...JSON.parse(fs.readFileSync(path.join(root,'release.json'),'utf8'))});return true;}}}catch{}}

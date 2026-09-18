@@ -2060,6 +2060,7 @@ describe("CodexAppServerManager", () => {
     expect(resultEvent?.entry.subtype).toBe("error")
     expect(resultEvent?.entry.result).toContain("fatal: app-server crashed")
   })
+
   test("keeps the turn running through a retryable error and reports it as status", async () => {
     const process = new FakeCodexProcess((message, child) => {
       if (message.method === "initialize") {

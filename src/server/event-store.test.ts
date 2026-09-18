@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, spyOn, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
@@ -26,10 +26,24 @@ async function createTempDataDir() {
   return dir
 }
 
-function entry(kind: "user_prompt" | "assistant_text", createdAt: number, extra: Record<string, unknown> = {}): TranscriptEntry {
+function entry(
+  kind: "user_prompt" | "assistant_text" | "result",
+  createdAt: number,
+  extra: Record<string, unknown> = {},
+): TranscriptEntry {
   const base = { _id: `${kind}-${createdAt}`, createdAt }
   if (kind === "user_prompt") {
     return { ...base, kind, content: String(extra.content ?? "") }
+  }
+  if (kind === "result") {
+    return {
+      ...base,
+      kind,
+      subtype: "success",
+      isError: false,
+      durationMs: Number(extra.durationMs ?? 0),
+      result: String(extra.result ?? ""),
+    }
   }
   return { ...base, kind, text: String(extra.content ?? extra.text ?? "") }
 }
@@ -839,6 +853,94 @@ describe("EventStore", () => {
     expect(store.getMessages(forked.id)).toEqual(store.getMessages(source.id))
   })
 
+  test("forking mid-turn branches from the last completed turn", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id)
+    await store.setChatProvider(source.id, "claude")
+    await store.setSessionToken(source.id, "session-1")
+
+    // A turn that finished.
+    await store.recordTurnStarted(source.id)
+    await store.appendMessage(source.id, entry("user_prompt", 1_000, { content: "analyze this" }))
+    await store.appendMessage(source.id, entry("assistant_text", 2_000, { text: "analysis done" }))
+    await store.appendMessage(source.id, entry("result", 3_000, { result: "ok", durationMs: 5 }))
+    await store.recordTurnFinished(source.id)
+
+    // …and one still running: a prompt and a reply whose tool results haven't landed.
+    await store.recordTurnStarted(source.id)
+    await store.appendMessage(source.id, entry("user_prompt", 4_000, { content: "now refactor it" }))
+    await store.appendMessage(source.id, entry("assistant_text", 5_000, { text: "starting the refactor" }))
+
+    const forked = await store.forkChat(source.id, { atLastCompletedTurn: true })
+
+    // The copy stops at the completed turn's result — the in-flight prompt and
+    // its half-written reply stay behind with the source.
+    expect(store.getMessages(forked.id)).toEqual(store.getMessages(source.id).slice(0, 3))
+    expect(forked.lastMessageAt).toBe(3_000)
+    // Previews describe the branch point, not the turn the fork left behind.
+    expect(forked.lastUserMessagePreview).toBe("analyze this")
+    expect(forked.lastAgentMessagePreview).toBe("analysis done")
+    expect(forked.lastAgentMessageAt).toBe(3_000)
+    expect(forked.turnCount).toBe(1)
+    // The source is untouched: its turn is still running.
+    expect(store.getMessages(source.id)).toHaveLength(5)
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.getMessages(forked.id)).toHaveLength(3)
+  })
+
+  test("refuses a mid-turn fork when no turn has completed yet", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id)
+    await store.setChatProvider(source.id, "claude")
+    await store.setSessionToken(source.id, "session-1")
+    await store.recordTurnStarted(source.id)
+    await store.appendMessage(source.id, entry("user_prompt", 1_000, { content: "first ever prompt" }))
+
+    const chatsBefore = store.listChatsByProject(project.id).length
+    await expect(store.forkChat(source.id, { atLastCompletedTurn: true })).rejects.toThrow(/no completed turn/)
+    // The refusal happens before anything is written — no half-built fork.
+    expect(store.listChatsByProject(project.id).length).toBe(chatsBefore)
+  })
+
+  test("the resume marker survives a restart and a compaction", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.recordTurnStarted(chat.id)
+    await store.setTurnResumePending(chat.id, true)
+    // Shutdown cancels the turn like any other cancel; the marker is what tells
+    // the next boot the difference.
+    await store.recordTurnCancelled(chat.id)
+    expect(store.requireChat(chat.id).resumePending).toBe(true)
+    expect(store.requireChat(chat.id).lastTurnOutcome).toBe("cancelled")
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(chat.id).resumePending).toBe(true)
+
+    // Cleared by the boot that acts on it, and the clear sticks the same way.
+    await reloaded.setTurnResumePending(chat.id, false)
+    await reloaded.compact()
+    expect(reloaded.requireChat(chat.id).resumePending).toBeUndefined()
+
+    const afterCompaction = new EventStore(dataDir)
+    await afterCompaction.initialize()
+    expect(afterCompaction.requireChat(chat.id).resumePending).toBeUndefined()
+  })
+
   test("lastAgentMessageAt tracks agent entries mid-turn, ignoring user prompts", async () => {
     const dataDir = await createTempDataDir()
     const store = new EventStore(dataDir)
@@ -1609,5 +1711,140 @@ describe("getClientTranscript window and outline", () => {
     await store.appendMessage(chat.id, { _id: "p3", createdAt: at + 5, kind: "user_prompt", content: "third" } as TranscriptEntry)
     expect(store.getClientTranscript(chat.id).outline.map((entry) => entry.id)).toEqual(["p1", "p2", "p3"])
     await rm(dataDir, { recursive: true, force: true })
+  })
+})
+
+
+describe("stateVersion", () => {
+  /**
+   * `stateVersion` is the sidebar memo key in ws-router. A transcript append
+   * must bump it only when it moved something the sidebar can actually show,
+   * otherwise a streaming turn re-derives and re-serializes the whole sidebar
+   * many times a second for bytes that come out identical.
+   */
+  test("agent entries inside one activity bucket do not bump it", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "proj")
+    const chat = await store.createChat(project.id)
+
+    const at = Date.now()
+    await store.appendMessage(chat.id, entry("user_prompt", at, { content: "go" }))
+
+    const before = store.stateVersion
+    for (let i = 0; i < 20; i++) {
+      // 20ms apart, so every one lands in the same 15s quantization bucket.
+      await store.appendMessage(chat.id, entry("assistant_text", at + 100 + i * 20, { text: `step ${i}` }))
+    }
+    // The first one moves lastAgentMessageAt into a bucket; the rest are free.
+    expect(store.stateVersion - before).toBe(1)
+  })
+
+  test("still bumps when a sidebar-visible field moves", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "proj")
+    const chat = await store.createChat(project.id)
+
+    const at = Date.now()
+    // hasMessages false -> true, and lastMessageAt is the sidebar sort key.
+    const afterFirstPrompt = store.stateVersion
+    await store.appendMessage(chat.id, entry("user_prompt", at, { content: "one" }))
+    expect(store.stateVersion).toBeGreaterThan(afterFirstPrompt)
+
+    // A later user prompt moves lastMessageAt, so it must bump again.
+    const beforeSecond = store.stateVersion
+    await store.appendMessage(chat.id, entry("user_prompt", at + 1_000, { content: "two" }))
+    expect(store.stateVersion).toBeGreaterThan(beforeSecond)
+
+    // Crossing into the next 15s activity bucket must bump.
+    const beforeBucketCross = store.stateVersion
+    await store.appendMessage(chat.id, entry("assistant_text", at + 40_000, { text: "much later" }))
+    expect(store.stateVersion).toBeGreaterThan(beforeBucketCross)
+  })
+})
+
+
+describe("chat pins", () => {
+  test("persists pin and unpin through replay and compaction", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.setChatPinned(chat.id, true)
+    const pinnedAt = store.getChat(chat.id)!.pinnedAt
+    expect(pinnedAt).toBeNumber()
+    await store.setChatPinned(chat.id, true)
+    expect(store.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
+
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
+    await replayed.compact()
+    const compacted = new EventStore(dataDir)
+    await compacted.initialize()
+    expect(compacted.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
+    await compacted.setChatPinned(chat.id, false)
+    const unpinned = new EventStore(dataDir)
+    await unpinned.initialize()
+    expect(unpinned.getChat(chat.id)!.pinnedAt).toBeUndefined()
+  })
+
+  test("replay preserves repinning after archive within the same millisecond", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    const timestamp = Date.now()
+    const clock = spyOn(Date, "now").mockReturnValue(timestamp)
+    try {
+      await store.setChatPinned(chat.id, true)
+      await store.archiveChat(chat.id)
+      await store.unarchiveChat(chat.id)
+      await store.setChatPinned(chat.id, true)
+    } finally {
+      clock.mockRestore()
+    }
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.getChat(chat.id)!.pinnedAt).toBe(timestamp)
+    expect(replayed.getChat(chat.id)!.archivedAt).toBeUndefined()
+  })
+
+  test("cleanup preserves pinned chats, including empty chats", async () => {
+    const store = new EventStore(await createTempDataDir())
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const empty = await store.createChat(project.id)
+    const old = await store.createChat(project.id)
+    await store.appendMessage(old.id, entry("user_prompt", old.createdAt + 1))
+    await store.setChatPinned(empty.id, true)
+    await store.setChatPinned(old.id, true)
+    const now = old.createdAt + 100 * 24 * 60 * 60 * 1000
+    const fresh = await store.createChat(project.id)
+    await store.appendMessage(fresh.id, entry("user_prompt", now))
+    expect(await store.pruneStaleEmptyChats({ now })).toEqual([])
+    expect(await store.autoArchiveStaleChats({ now })).toEqual([])
+    expect(await store.deleteStaleChats({ now })).toEqual([])
+    await store.setChatPinned(old.id, false)
+    expect(await store.autoArchiveStaleChats({ now })).toEqual([old.id])
+  })
+
+  test("manual archive clears the pin and restore keeps it unpinned", async () => {
+    const store = new EventStore(await createTempDataDir())
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.setChatPinned(chat.id, true)
+    await store.archiveChat(chat.id)
+    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
+    await store.setChatPinned(chat.id, true)
+    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
+    await store.unarchiveChat(chat.id)
+    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
   })
 })

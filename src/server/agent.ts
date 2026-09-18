@@ -113,6 +113,32 @@ interface PendingToolRequest {
   resolve: (result: unknown) => void
 }
 
+function normalizePreviewText(text: string) {
+  return text.replace(/\s+/g, " ").trim()
+}
+
+/**
+ * One line of what the chat is waiting on, for the sidebar row and the system
+ * notification that quotes it: the questions asked, or the plan's summary.
+ */
+function getToolRequestPreview(tool: PendingToolRequest["tool"]) {
+  if (tool.toolKind === "ask_user_question") {
+    const questions = tool.input.questions
+      .map((question) => normalizePreviewText(question.question))
+      .filter(Boolean)
+    if (questions.length > 0) return questions.join(" ")
+  }
+
+  if (tool.toolKind === "exit_plan_mode") {
+    const summary = normalizePreviewText(tool.input.summary ?? "")
+    if (summary) return summary
+    const plan = normalizePreviewText(tool.input.plan ?? "")
+    if (plan) return plan
+  }
+
+  return "Waiting for your response."
+}
+
 interface ActiveTurn {
   chatId: string
   provider: AgentProvider
@@ -232,6 +258,18 @@ function logClaudeSteer(stage: string, details?: Record<string, unknown>) {
 
 const STEERED_MESSAGE_PREFIX = `<system-message>
 The user would like to inform you of something while you continue to work. Acknowledge receipt immediately with a text response, then continue with the task at hand, incorporating the user's feedback if needed.
+</system-message>`
+
+/**
+ * Wire-only prompt that restarts a turn Kanna killed by shutting down (see
+ * `AgentCoordinator.resumeInterruptedTurn`). The harness session carries the
+ * original prompt and the work already done, so this only has to say what
+ * happened and warn that the last thing it was doing may be half-finished —
+ * the process died mid-tool-call as often as not.
+ */
+export const RESUME_AFTER_RESTART_MESSAGE = `<system-message>
+Kanna restarted while you were working on this, so your process was stopped mid-task and is now back up. Continue the task you were on from where it left off.
+Whatever you were doing last may not have completed — re-check the state of any file you were editing and any command you had running before assuming it finished.
 </system-message>`
 
 interface SendMessageOptions {
@@ -947,6 +985,25 @@ export class AgentCoordinator {
     return this.codexManager
   }
 
+  getResourceCounts() {
+    return {
+      activeTurns: this.activeTurns.size,
+      drainingStreams: this.drainingStreams.size,
+      claudeSessions: this.claudeSessions.size,
+      ...this.codexManager.getResourceCounts(),
+      ...this.piManager.getResourceCounts(),
+    }
+  }
+
+  dispose() {
+    for (const session of this.claudeSessions.values()) session.session.close()
+    this.claudeSessions.clear()
+    for (const stream of this.drainingStreams.values()) stream.turn.close()
+    this.drainingStreams.clear()
+    this.codexManager.stopAll()
+    this.piManager.dispose()
+  }
+
   getActiveStatuses() {
     const statuses = new Map<string, KannaStatus>()
     for (const [chatId, turn] of this.activeTurns.entries()) {
@@ -958,7 +1015,11 @@ export class AgentCoordinator {
   getPendingTool(chatId: string): PendingToolSnapshot | null {
     const pending = this.activeTurns.get(chatId)?.pendingTool
     if (!pending) return null
-    return { toolUseId: pending.toolUseId, toolKind: pending.tool.toolKind }
+    return {
+      toolUseId: pending.toolUseId,
+      toolKind: pending.tool.toolKind,
+      preview: getToolRequestPreview(pending.tool),
+    }
   }
 
   getDrainingChatIds(): Set<string> {
@@ -1047,6 +1108,7 @@ export class AgentCoordinator {
       claudeSession.session.close()
       this.claudeSessions.delete(chatId)
     }
+    this.codexManager.stopSession(chatId)
     this.piManager.closeChat(chatId)
     this.emitStateChange(chatId)
   }
@@ -1330,8 +1392,18 @@ export class AgentCoordinator {
     await this.store.setPlanMode(args.chatId, args.planMode)
     await this.store.setAutoPlan(args.chatId, args.autoPlan)
 
-    const existingMessages = this.store.getMessages(args.chatId)
-    const shouldGenerateTitle = args.appendUserPrompt && chat.title === "New Chat" && existingMessages.length === 0
+    // Lazy: `getMessages` reads the whole payload sidecar (its own docstring
+    // says it is "for export, handoff and fork, not for anything that runs per
+    // push"), which measures 3 ms on a short chat and ~45 ms on a 2,300-entry
+    // one. Only the handoff and session-restore paths below actually need it;
+    // the empty-chat check just needs a count.
+    let existingMessagesCache: ReturnType<typeof this.store.getMessages> | null = null
+    const existingMessages = () => (existingMessagesCache ??= this.store.getMessages(args.chatId))
+    // `chat.title === "New Chat"` short-circuits first, and it is only true for
+    // a chat that has never been titled - whose sidecar is empty. So on every
+    // later message the sidecar is never read at all.
+    const shouldGenerateTitle = args.appendUserPrompt && chat.title === "New Chat"
+      && existingMessages().length === 0
     const optimisticTitle = shouldGenerateTitle ? fallbackTitleFromMessage(args.content) : null
 
     if (optimisticTitle) {
@@ -1349,7 +1421,7 @@ export class AgentCoordinator {
     // transcript, and build the wire-only handoff context from the entries
     // that precede this turn's prompt.
     const handoff = previousProvider !== null && previousProvider !== args.provider
-      ? await this.prepareProviderHandoff(args.chatId, previousProvider, args.provider, existingMessages)
+      ? await this.prepareProviderHandoff(args.chatId, previousProvider, args.provider, existingMessages())
       : null
 
     // Same-provider session recovery: when we're NOT switching harnesses but
@@ -1360,7 +1432,7 @@ export class AgentCoordinator {
     // and prepend the rebuilt context on the wire. Runs before the user prompt
     // is appended so the boundary precedes it, mirroring the handoff ordering.
     const restore = !handoff && previousProvider !== null
-      && ((!chat.sessionToken && !chat.pendingForkSessionToken && existingMessages.length > 0) || await this.detectLostProviderSession({
+      && ((!chat.sessionToken && !chat.pendingForkSessionToken && existingMessages().length > 0) || await this.detectLostProviderSession({
         chatId: args.chatId,
         provider: args.provider,
         cwd: project.localPath,
@@ -1369,7 +1441,7 @@ export class AgentCoordinator {
         sessionToken: chat.sessionToken,
         pendingForkSessionToken: chat.pendingForkSessionToken,
       }))
-      ? await this.prepareSessionRestore(args.chatId, args.provider, existingMessages)
+      ? await this.prepareSessionRestore(args.chatId, args.provider, existingMessages())
       : null
 
     if (args.appendUserPrompt) {
@@ -1391,14 +1463,13 @@ export class AgentCoordinator {
         throw new Error("Chat turn ended unexpectedly")
       }
 
-      active.status = "waiting_for_user"
-
       return await new Promise<unknown>((resolve) => {
         active.pendingTool = {
           toolUseId: request.tool.toolId,
           tool: request.tool,
           resolve,
         }
+        active.status = "waiting_for_user"
         this.emitStateChange(args.chatId)
       })
     }
@@ -1745,6 +1816,19 @@ export class AgentCoordinator {
       planMode: command.planMode,
       autoPlan: command.autoPlan,
     })
+    if (command.steer) {
+      // The same path as "Send now" on a queued message, so the two can't
+      // drift. One thing it has to absorb: the turn can end while the message
+      // was being queued, in which case the drain has already started it —
+      // the outcome steering wanted, just not by this call.
+      try {
+        await this.steer({ type: "message.steer", chatId: command.chatId, queuedMessageId: queuedMessage.id })
+      } catch (error) {
+        const drained = !this.store.getQueuedMessage(command.chatId, queuedMessage.id)
+          && this.activeTurns.has(command.chatId)
+        if (!drained) throw error
+      }
+    }
     return { queuedMessageId: queuedMessage.id }
   }
 
@@ -1884,11 +1968,84 @@ export class AgentCoordinator {
     return scanned?.path ? { name: scanned.name, path: scanned.path } : undefined
   }
 
+  /**
+   * Cancel every in-flight turn because Kanna itself is going down, marking
+   * each chat so the next boot picks the work back up (`resumeInterruptedTurn`).
+   *
+   * Everything a user-initiated cancel does still happens — the harness is
+   * interrupted, the pending tool call is discarded, the transcript gets its
+   * `interrupted` entry — so a chat that never gets resumed reads exactly as it
+   * does today. The marker is written first: a shutdown that dies partway
+   * through leaves a chat resumable-but-not-cancelled, which the resume pass
+   * handles, rather than cancelled-but-forgotten, which it can't.
+   *
+   * A turn parked on a tool request (AskUserQuestion, plan approval) is not
+   * marked. Cancelling it feeds the harness a discarded result, and a resume
+   * would then tell the model to "continue" past a question nobody answered or
+   * a plan nobody approved. Those chats stay interrupted so the user re-asks.
+   */
+  async interruptForShutdown() {
+    for (const [chatId, active] of [...this.activeTurns.entries()]) {
+      if (!active.pendingTool) {
+        try {
+          await this.store.setTurnResumePending(chatId, true)
+        } catch {
+          // Best effort — a chat we can't mark still gets cancelled cleanly.
+        }
+      }
+      await this.cancel(chatId)
+    }
+  }
+
+  /**
+   * Restart a turn that the previous process cut short by shutting down.
+   *
+   * The prompt is wire-only (`appendUserPrompt: false`), so the transcript
+   * shows the interrupted turn picking back up rather than a user message
+   * nobody typed. Resuming leans on the harness session having survived: it
+   * holds the original prompt and everything the turn did before it died, so
+   * "carry on" is all that has to be said. When the session is gone,
+   * `startTurnForChat`'s own recovery notices and rebuilds the context from our
+   * transcript first (`prepareSessionRestore`), which is exactly what's wanted.
+   *
+   * Returns whether a turn was actually started.
+   */
+  async resumeInterruptedTurn(chatId: string) {
+    const chat = this.store.getChat(chatId)
+    if (!chat || chat.deletedAt) return false
+    if (!chat.provider) return false
+    if (this.activeTurns.has(chatId)) return false
+    // No session to resume into means the harness never got far enough to have
+    // context worth continuing; a bare "carry on" would be sent into an empty
+    // session, so leave the chat interrupted instead.
+    if (!chat.sessionToken && !chat.pendingForkSessionToken) return false
+
+    // Everything the chat record remembers about how the turn was running:
+    // the model it actually ran with plus the two persisted modes. Reasoning
+    // effort and fast mode are picked in the composer and never stored server
+    // side, so the resumed turn falls back to the provider defaults for those.
+    const settings = this.getProviderSettings(chat.provider, {
+      model: chat.lastModel,
+      planMode: chat.planMode,
+      autoPlan: chat.autoPlan,
+    })
+    await this.startTurnForChat({
+      chatId,
+      provider: chat.provider,
+      content: RESUME_AFTER_RESTART_MESSAGE,
+      attachments: [],
+      model: settings.model,
+      effort: settings.effort,
+      serviceTier: settings.serviceTier,
+      planMode: settings.planMode,
+      autoPlan: settings.autoPlan,
+      appendUserPrompt: false,
+    })
+    return true
+  }
+
   async forkChat(chatId: string) {
     const chat = this.store.requireChat(chatId)
-    if (this.activeTurns.has(chatId) || this.drainingStreams.has(chatId)) {
-      throw new Error("Chat must be idle before forking")
-    }
     if (!chat.provider) {
       throw new Error("Chat must have a provider before forking")
     }
@@ -1896,7 +2053,12 @@ export class AgentCoordinator {
       throw new Error("Chat has no session to fork")
     }
 
-    const forked = await this.store.forkChat(chatId)
+    // A running chat is forkable: the fork branches from the last completed
+    // turn, leaving the turn in flight out of the copy so it never inherits
+    // tool calls whose results have not arrived. Nothing here touches the
+    // source's turn — it keeps running.
+    const running = this.activeTurns.has(chatId) || this.drainingStreams.has(chatId)
+    const forked = await this.store.forkChat(chatId, { atLastCompletedTurn: running })
     this.analytics.track("chat_created")
     return { chatId: forked.id }
   }

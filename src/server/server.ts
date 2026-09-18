@@ -1,7 +1,9 @@
 import { createLocalAccess, localAccessUrls, TOKEN_LOGIN_HTML } from "./local-access"
+import { homedir } from "node:os"
+import { PerformanceLog } from "./performance-log"
 import path from "node:path"
 import { stat } from "node:fs/promises"
-import { APP_NAME, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
+import { APP_NAME, getDataDir, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
 import type { ChatAttachment } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import {
@@ -20,11 +22,14 @@ import { AgentCoordinator } from "./agent"
 import { CodexAppServerManager } from "./codex-app-server"
 import { KannaAnalyticsReporter } from "./analytics"
 import { AppSettingsManager } from "./app-settings"
+import { refreshInstalledEditors } from "./editor-detection"
+import { refreshInstalledTerminals } from "./terminal-detection"
 import { UsageLimitsManager } from "./usage-limits"
 import { DiffStore } from "./diff-store"
 import { WorktreeProbe } from "./worktree-probe"
 import { TurnFileTracker } from "./worktree-snapshot"
 import { backfillTouchedFileBases } from "./touched-file-backfill"
+import { resumeInterruptedTurns } from "./resume-turns"
 import { discoverProjects, type DiscoveredProject } from "./discovery"
 import { KeybindingsManager } from "./keybindings"
 import { clearGitHubRepoCache } from "./github"
@@ -142,7 +147,8 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const strictPort = options.strictPort ?? false
   const runtimeProfile = getRuntimeProfile()
   const auth = options.password ? createAuthManager(options.password, { trustProxy: options.trustProxy ?? false }) : null
-  const store = new EventStore(options.dataDir)
+  const diagnostics = new PerformanceLog(options.dataDir ?? getDataDir(homedir()), undefined, options.update?.version)
+  const store = new EventStore(options.dataDir, diagnostics)
   const diffStore = new DiffStore(store.dataDir)
   const machineDisplayName = getMachineDisplayName()
   // Mutable: device-code pairing can attach a cloud runtime mid-flight, and
@@ -216,6 +222,11 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const devboxUi = Boolean(options.directCloud) || process.env.KANNA_DEVBOX_UI === "1"
   const appSettings = new AppSettingsManager(path.join(store.dataDir, "settings.json"), { devbox: devboxUi })
   await appSettings.initialize()
+  // Which editors and terminals this machine has, for the "Open in…" menus.
+  // Deliberately not awaited: it shells out per app, and the menus render
+  // fine (nothing greyed out) until the result lands.
+  void refreshInstalledEditors(appSettings)
+  void refreshInstalledTerminals(appSettings)
   await keybindings.initialize()
   const analytics = new KannaAnalyticsReporter({
     settings: appSettings,
@@ -282,6 +293,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   })
 
   router = createWsRouter({
+    diagnostics,
     store,
     diffStore,
     worktreeProbe,
@@ -298,6 +310,10 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       validate: validateLlmProviderCredentials,
     },
     refreshDiscovery,
+    refreshInstalledApps: () => {
+      void refreshInstalledEditors(appSettings)
+      void refreshInstalledTerminals(appSettings)
+    },
     getDiscoveredProjects: () => discoveredProjects,
     machineDisplayName,
     updateManager,
@@ -357,7 +373,27 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       await router.broadcastSnapshots()
     }
   }
+  // Chats that were mid-turn when Kanna last exited pick up where they left
+  // off. Not awaited — each resume starts a harness process, and boot should
+  // not wait on them; chained onto the GC sweep so a chat about to be archived
+  // or deleted for staleness isn't resumed on its way out.
   void runStartupGc()
+    .then(() => resumeInterruptedTurns({
+      store,
+      agent,
+      onError: (chatId, error) => {
+        console.warn(`${LOG_PREFIX} could not resume chat ${chatId} after restart:`, error)
+      },
+    }))
+    .then(async (resumedChatIds) => {
+      if (resumedChatIds.length > 0) {
+        console.log(`${LOG_PREFIX} resumed ${resumedChatIds.length} chat(s) interrupted by the last shutdown`)
+        await router.broadcastSnapshots()
+      }
+    })
+    .catch((error) => {
+      console.warn(`${LOG_PREFIX} resuming interrupted chats failed:`, error)
+    })
 
   // Then keep sweeping for the lifetime of the (potentially months-long)
   // process: empties every minute, deletes daily, archives every 6 hours.
@@ -564,6 +600,31 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
             const models = await agent.getCodexManager().getSubagentModels(chatId, children.map(child=>child.threadId))
             return Response.json({models:Object.fromEntries(children.filter(child=>models[child.threadId]).map(child=>[child.toolId,models[child.threadId]]))}, {headers:{"Cache-Control":"no-store"}})
           }
+          if (url.pathname === "/api/diagnostics/client") {
+            if (req.method !== "POST") return new Response(null, { status: 405 })
+            if (!req.headers.get("content-type")?.startsWith("application/json")) return new Response(null, { status: 415 })
+            const reader = req.body?.getReader()
+            if (!reader) return new Response(null, { status: 400 })
+            let bytes = 0
+            const chunks: Uint8Array[] = []
+            try {
+              while (true) {
+                const { done, value } = await reader.read()
+                if (done) break
+                bytes += value.length
+                if (bytes > 8192) {
+                  await reader.cancel()
+                  return new Response(null, { status: 413 })
+                }
+                chunks.push(value)
+              }
+              const summary = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+              diagnostics.mergeClientSummary(summary?.metrics, typeof summary?.clientId === "string" ? summary.clientId : undefined)
+              return new Response(null, { status: 204 })
+            } catch {
+              return new Response(null, { status: 400 })
+            } finally { reader.releaseLock() }
+          }
 
           if (url.pathname === "/health") {
             // `instance` lets a second `kanna` invocation detect that this
@@ -674,7 +735,10 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
             router.handleOpen(ws)
           },
           message(ws, raw) {
-            router.handleMessage(ws, raw)
+            void router.handleMessage(ws, raw).catch(error => {
+              diagnostics.record("socket_handler_errors")
+              console.error("[ws-router] Handler failed:", error instanceof Error ? error.message : String(error))
+            })
           },
           close(ws) {
             router.handleClose(ws)
@@ -703,6 +767,14 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     cloud: Boolean(options.cloud),
   })
 
+  diagnostics.start(() => ({
+    ...store.getResourceCounts(),
+    ...router.getResourceCounts(),
+    ...agent.getResourceCounts(),
+    ...terminals.getResourceCounts(),
+    ...diffStore.getResourceCounts(),
+  }))
+
   const shutdown = async () => {
     pairSession?.stop()
     // A runtime handed in by the CLI is stopped by the CLI; one this process
@@ -712,9 +784,9 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     clearInterval(staleChatAutoArchiveInterval)
     clearInterval(staleChatDeleteInterval)
     worktreeProbe.stop()
-    for (const chatId of [...agent.activeTurns.keys()]) {
-      await agent.cancel(chatId)
-    }
+    // Cancels every in-flight turn *and* marks its chat, so the next boot
+    // restarts the work instead of leaving it interrupted (see resume-turns.ts).
+    try { await agent.interruptForShutdown() } finally { agent.dispose() }
     router.dispose()
     providerAuth.dispose()
     usageLimits.dispose()
@@ -723,6 +795,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     terminals.closeAll()
     portTunnels.stopAll()
     await store.compact()
+    await diagnostics.stop()
     server.stop(true)
   }
 

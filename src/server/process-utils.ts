@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process"
 import { accessSync, constants, statSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
+import process from "node:process"
 
 function formatSpawnError(command: string, error: unknown) {
   if (!(error instanceof Error)) {
@@ -44,6 +45,38 @@ export function hasCommand(command: string) {
   return result.status === 0
 }
 
+function succeedsAsync(command: string, args: string[]) {
+  return new Promise<boolean>((resolve) => {
+    let child
+    try {
+      child = spawn(command, args, { stdio: "ignore" })
+    } catch {
+      resolve(false)
+      return
+    }
+    child.once("error", () => resolve(false))
+    child.once("close", (code) => resolve(code === 0))
+  })
+}
+
+/**
+ * `hasCommand` without blocking the event loop — for probes run in bulk.
+ *
+ * Windows has no `sh`, so asking it there would report every command missing
+ * and quietly grey out the whole menu; `where` is the equivalent lookup.
+ */
+export function commandExists(command: string) {
+  if (process.platform === "win32") {
+    return succeedsAsync("where", [command])
+  }
+  return succeedsAsync("sh", ["-lc", `command -v ${command}`])
+}
+
+/** `canOpenMacApp` without blocking the event loop. */
+export function macAppExists(appName: string) {
+  return succeedsAsync("open", ["-Ra", appName])
+}
+
 /**
  * Per-user bin dirs installers target without necessarily reaching the
  * sh login PATH: the native Claude Code installer uses ~/.local/bin but adds
@@ -74,6 +107,17 @@ function findInUserBinDirs(command: string, homeDir: string): string | null {
  */
 export function resolveCommandPath(command: string, homeDir = homedir()): string | null {
   if (!/^[\w.-]+$/.test(command)) return null
+
+  // Fast path: the login shell below is a synchronous spawn that blocks the
+  // event loop for ~5 ms (up to 24 ms observed here), and callers like
+  // diff-store's `gh` runner hit this per invocation. `Bun.which` is ~0.045 ms.
+  // It only sees the server's own PATH — which is exactly the gap the login
+  // shell exists to cover — so it is a fast path, not a replacement.
+  // Deliberately not memoized: callers that need to re-resolve after an install
+  // (provider-auth's `fresh` option) must not be served a stale path.
+  const direct = Bun.which(command)
+  if (direct) return direct
+
   const result = spawnSync("sh", ["-lc", `command -v -- ${command}`], {
     stdio: ["ignore", "pipe", "ignore"],
     encoding: "utf8",

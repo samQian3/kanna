@@ -1,13 +1,13 @@
 import { memo } from "react"
-import { ArrowLeft, Check, Flower, GitBranch, Globe, Loader2, MoreHorizontal, PanelLeft, PanelRight, Search, SquarePen, Terminal, UserRoundPlus } from "lucide-react"
-import type { EditorOpenSettings, EditorPreset, OpenExternalAction } from "../../../shared/protocol"
+import { ArrowLeft, Check, Flower, GitBranch, Globe, Loader2, MoreHorizontal, PanelLeft, PanelRight, Search, Terminal, UserRoundPlus } from "lucide-react"
+import type { EditorOpenSettings, EditorPreset, OpenExternalAction, TerminalPreset } from "../../../shared/protocol"
 import { Button } from "../ui/button"
 import { CardHeader } from "../ui/card"
 import { HotkeyTooltip, HotkeyTooltipContent, HotkeyTooltipTrigger } from "../ui/tooltip"
 import { cn } from "../../lib/utils"
-import { OpenExternalSelect, openContextMenuFromButton } from "../open-external-menu"
+import { OpenAppMenuItems, OpenExternalSelect, openContextMenuFromButton } from "../open-external-menu"
 import { OPEN_COMMAND_PALETTE_EVENT } from "../command-palette/CommandPalette"
-import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "../ui/context-menu"
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "../ui/context-menu"
 import { useAppSettingsStore } from "../../stores/appSettingsStore"
 
 function NavbarOverflowMenu({
@@ -17,6 +17,11 @@ function NavbarOverflowMenu({
   canExportTranscript,
   isExportingTranscript,
   exportTranscriptComplete,
+  isMac,
+  editorPreset,
+  editorCommandTemplate,
+  repoUrl,
+  onOpenExternal,
 }: {
   showOnDesktop: boolean
   onToggleEmbeddedTerminal?: () => void
@@ -24,8 +29,13 @@ function NavbarOverflowMenu({
   canExportTranscript: boolean
   isExportingTranscript: boolean
   exportTranscriptComplete: boolean
+  isMac: boolean
+  editorPreset: EditorPreset
+  editorCommandTemplate?: string
+  repoUrl?: string
+  onOpenExternal?: (action: OpenExternalAction, editor?: EditorOpenSettings, terminal?: TerminalPreset) => void
 }) {
-  if (!onToggleEmbeddedTerminal && !onExportTranscript) return null
+  if (!onToggleEmbeddedTerminal && !onExportTranscript && !onOpenExternal) return null
 
   return (
     <ContextMenu>
@@ -44,6 +54,25 @@ function NavbarOverflowMenu({
         </Button>
       </ContextMenuTrigger>
       <ContextMenuContent>
+        {/* Below `md` the split button is hidden for want of room, so its
+            destinations ride along here instead of being unreachable. Above
+            it they would be a duplicate of the button sitting alongside. */}
+        {onOpenExternal ? (
+          <>
+            <OpenAppMenuItems
+              isMac={isMac}
+              editorPreset={editorPreset}
+              editorCommandTemplate={editorCommandTemplate}
+              includeFinder
+              includeTerminal
+              repoUrl={repoUrl}
+              menuKind="navbar"
+              itemClassName="md:hidden"
+              onOpenExternal={onOpenExternal}
+            />
+            <ContextMenuSeparator className="md:hidden" />
+          </>
+        ) : null}
         {onToggleEmbeddedTerminal ? (
           <ContextMenuItem
             onSelect={(event) => {
@@ -83,14 +112,13 @@ interface Props {
   sidebarCollapsed: boolean
   onOpenSidebar: () => void
   onExpandSidebar: () => void
-  onNewChat: () => void
   localPath?: string
   embeddedTerminalVisible?: boolean
   onToggleEmbeddedTerminal?: () => void
   rightPanel?: "hidden" | "git" | "browser"
   onToggleGitPanel?: () => void
   onToggleBrowserPanel?: () => void
-  onOpenExternal?: (action: OpenExternalAction, editor?: EditorOpenSettings) => void
+  onOpenExternal?: (action: OpenExternalAction, editor?: EditorOpenSettings, terminal?: TerminalPreset) => void
   onExportTranscript?: () => void
   canExportTranscript?: boolean
   isExportingTranscript?: boolean
@@ -118,7 +146,6 @@ function ChatNavbarImpl({
   sidebarCollapsed,
   onOpenSidebar,
   onExpandSidebar,
-  onNewChat,
   localPath,
   embeddedTerminalVisible = false,
   onToggleEmbeddedTerminal,
@@ -209,15 +236,6 @@ function ChatNavbarImpl({
           >
             <Search className="size-4 max-md:size-5" />
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="max-md:h-[45px] max-md:w-[42px] hover:!border-border/0 hover:!bg-transparent"
-            onClick={onNewChat}
-            title="Compose"
-          >
-            <SquarePen className="size-4 max-md:size-5" />
-          </Button>
         </div>
 
         <div className="flex-1 min-w-0" />
@@ -237,7 +255,7 @@ function ChatNavbarImpl({
                 />
               </div>
             ) : null}
-            {(onToggleEmbeddedTerminal || onToggleGitPanel || onToggleBrowserPanel || onExportTranscript) ? (
+            {(onToggleEmbeddedTerminal || onToggleGitPanel || onToggleBrowserPanel || onExportTranscript || onOpenExternal) ? (
               <div className="flex items-center  rounded-[9px] h-[30px]">
                 <NavbarOverflowMenu
                   showOnDesktop={rightPanelVisible}
@@ -246,6 +264,11 @@ function ChatNavbarImpl({
                   canExportTranscript={canExportTranscript}
                   isExportingTranscript={isExportingTranscript}
                   exportTranscriptComplete={exportTranscriptComplete}
+                  isMac={isMac}
+                  editorPreset={editorPreset}
+                  editorCommandTemplate={editorCommandTemplate}
+                  repoUrl={repoUrl}
+                  onOpenExternal={onOpenExternal}
                 />
                 {onToggleEmbeddedTerminal ? (
                 <HotkeyTooltip>

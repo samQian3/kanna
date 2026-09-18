@@ -5,6 +5,7 @@ import {
   computeThreadDateBuckets,
   computeThreadSections,
   flattenSidebarThreads,
+  getArchivedThreads,
   getInProgressThreads,
   getRecentThreads,
   getRelevantThreads,
@@ -13,6 +14,7 @@ import {
   RECENT_THREADS_LIMIT,
   stabilizeSidebarThreads,
 } from "./thread-sections"
+import { focusSidebarData, resolveFocusedProjectGroup } from "../stores/focusModeStore"
 import { stabilizeSidebarData } from "../app/sidebarStability"
 
 function makeChatRow(overrides: Partial<SidebarChatRow> & Pick<SidebarChatRow, "chatId" | "title">): SidebarChatRow {
@@ -459,6 +461,34 @@ describe("computeSidebarThreadSections", () => {
     expect(sections.archived.map((thread) => thread.chatId)).toEqual(["archived-new", "archived-old"])
   })
 
+  test("archived sorts by when it was archived, not by activity", () => {
+    const data = makeData([], [
+      // Dormant for a month, archived a moment ago: it leads, because this list
+      // answers "what did I just put away".
+      makeChatRow({
+        chatId: "just-archived",
+        title: "x",
+        lastMessageAt: at(2026, 7, 1),
+        archivedAt: at(2026, 7, 20),
+      }),
+      makeChatRow({
+        chatId: "archived-earlier",
+        title: "y",
+        lastMessageAt: at(2026, 7, 15),
+        archivedAt: at(2026, 7, 16),
+      }),
+      // Pre-dates `archivedAt`: falls back to its activity, so it sorts last.
+      makeChatRow({ chatId: "legacy", title: "z", lastMessageAt: at(2026, 7, 10) }),
+    ])
+
+    const archived = getArchivedThreads(flattenSidebarThreads(data))
+    expect(archived.map((thread) => thread.chatId)).toEqual([
+      "just-archived",
+      "archived-earlier",
+      "legacy",
+    ])
+  })
+
   test("Relevant drains flagged chats out of the date buckets", () => {
     const data = makeData([
       makeChatRow({ chatId: "dirty-old", title: "a", uncommittedWork: true, lastMessageAt: at(2026, 7, 10) }),
@@ -750,5 +780,48 @@ describe("stabilizeSidebarThreads", () => {
   test("passes the first list through", () => {
     const threads = flattenSidebarThreads(makeSidebarData())
     expect(stabilizeSidebarThreads([], threads)).toBe(threads)
+  })
+})
+
+
+describe("pinned sidebar chats", () => {
+  test("pins stay separate from status, drafts, and date buckets", () => {
+    const data = makeData([
+      makeChatRow({ chatId: "running", title: "Running", pinnedAt: 1, status: "running", lastMessageAt: NOW }),
+      makeChatRow({ chatId: "review", title: "Review", pinnedAt: 2, unread: true, lastMessageAt: NOW }),
+      makeChatRow({ chatId: "relevant", title: "Relevant", pinnedAt: 3, uncommittedWork: true, lastMessageAt: NOW }),
+      makeChatRow({ chatId: "empty", title: "Empty", pinnedAt: 4 }),
+    ], [makeChatRow({ chatId: "archived", title: "Archived", pinnedAt: 5, lastMessageAt: NOW })])
+    const threads = flattenSidebarThreads(data)
+    const sections = computeSidebarThreadSections(threads, NOW, new Map([["empty", NOW]]), new Map([["review", NOW + 1]]))
+    expect(sections.pinned.map((thread) => thread.chatId)).toEqual(["empty", "relevant", "review", "running"])
+    expect(sections.inProgress).toEqual([])
+    expect(mergeRelevantThreads(sections)).toEqual([])
+    expect(sections.buckets).toEqual([])
+    expect(sections.archived.map((thread) => thread.chatId)).toEqual(["archived"])
+  })
+
+  test("focus mode filters pins to the current project", () => {
+    const data = makeSidebarData()
+    data.projectGroups[0]!.chats[0]!.pinnedAt = 1
+    data.projectGroups[1]!.chats[0]!.pinnedAt = 2
+    const focused = resolveFocusedProjectGroup(data.projectGroups, true, "project-a")
+    const sections = computeSidebarThreadSections(flattenSidebarThreads(focusSidebarData(data, focused)), NOW)
+    expect(sections.pinned.map((thread) => thread.chatId)).toEqual(["chat-1"])
+    const all = computeSidebarThreadSections(flattenSidebarThreads(focusSidebarData(data, null)), NOW)
+    expect(all.pinned.map((thread) => thread.chatId)).toEqual(["chat-4", "chat-1"])
+  })
+
+  test("pin changes survive snapshot comparison and unpin restores normal sections", () => {
+    const before = makeSidebarData()
+    const changed = structuredClone(before)
+    changed.projectGroups[0]!.chats[0]!.pinnedAt = 123
+    const pinned = stabilizeSidebarData(before, changed)
+    expect(pinned).not.toBe(before)
+    expect(computeSidebarThreadSections(flattenSidebarThreads(pinned), NOW).pinned.map((thread) => thread.chatId)).toEqual(["chat-1"])
+    const unpinned = stabilizeSidebarData(pinned, structuredClone(before))
+    const sections = computeSidebarThreadSections(flattenSidebarThreads(unpinned), NOW)
+    expect(sections.pinned).toEqual([])
+    expect(sections.buckets.flatMap((bucket) => bucket.threads).map((thread) => thread.chatId)).toContain("chat-1")
   })
 })

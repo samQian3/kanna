@@ -1,3 +1,6 @@
+import type { TerminalPreset } from "./terminal-presets"
+
+export type { TerminalPreset }
 export const STORE_VERSION = 2 as const
 export const PROTOCOL_VERSION = 1 as const
 
@@ -5,9 +8,17 @@ export type AgentProvider = "claude" | "codex" | "cursor" | "pi"
 export type LlmProviderKind = "openai" | "openrouter" | "custom"
 export type AppThemePreference = "light" | "dark" | "system"
 export type ChatSoundPreference = "never" | "unfocused" | "always"
+/** Same gates as the chime, applied to system notifications. Off by default: it needs a permission prompt. */
+export type ChatBrowserNotificationPreference = ChatSoundPreference
 export type ChatSoundId = "blow" | "bottle" | "frog" | "funk" | "glass" | "ping" | "pop" | "purr" | "tink"
 export type DefaultProviderPreference = "last_used" | AgentProvider
-export type EditorPreset = "cursor" | "vscode" | "xcode" | "windsurf" | "custom"
+/**
+ * What pressing Enter does while a turn is running: hold the message until the
+ * turn ends, or interrupt and deliver it now. The modifier (⌘/Ctrl+Enter) always
+ * does the other one, so either is one keystroke away whatever the default.
+ */
+export type SubmitWhileRunning = "queue" | "steer"
+export type EditorPreset = "cursor" | "vscode" | "zed" | "xcode" | "windsurf" | "custom"
 export const DEFAULT_OPENAI_SDK_MODEL = "gpt-5.4-mini"
 export const DEFAULT_OPENROUTER_SDK_MODEL = "moonshotai/kimi-k2.5:nitro"
 
@@ -975,12 +986,25 @@ export interface SidebarChatRow {
   /** Tool kind the chat is waiting on when status is waiting_for_user (e.g. "ask_user_question"). */
   pendingToolKind?: string
   /**
+   * The question or plan summary behind `pendingToolKind`, so a system
+   * notification can quote it. Only set while the chat is waiting; message
+   * previews stay out of the sidebar (see `chat.getPreview`).
+   */
+  pendingUserInputPreview?: string
+  /**
    * Best-effort hint that this chat is relevant to the project's uncommitted
    * work: its last turn ended after the working tree became dirty. Project-
    * scoped, so every chat active since the dirt appeared is flagged — not just
    * whichever one caused it. Drives the muted (non-pulsing) sidebar dot.
    */
   uncommittedWork?: boolean
+  /**
+   * When the chat was archived. Set only on rows in `archivedChats`, and only
+   * the archive list reads it — sorting "recently archived" by last message
+   * would order by the conversation's age instead of by when it was put away.
+   */
+  archivedAt?: number
+  pinnedAt?: number
   hasAutomation: boolean
   canFork?: boolean
 }
@@ -1150,6 +1174,7 @@ export interface AppSettingsSnapshot {
   theme: AppThemePreference
   chatSoundPreference: ChatSoundPreference
   chatSoundId: ChatSoundId
+  chatBrowserNotificationPreference: ChatBrowserNotificationPreference
   terminal: {
     scrollbackLines: number
     minColumnWidth: number
@@ -1169,6 +1194,8 @@ export interface AppSettingsSnapshot {
     windowAssistantMessages: number
   }
   defaultProvider: DefaultProviderPreference
+  /** Default action for Enter while a turn is running. ⌘Enter does the other. */
+  submitWhileRunning: SubmitWhileRunning
   providerDefaults: ChatProviderPreferences
   /** Labs: the tabbed Chats/Projects "New Sidebar". On by default; false opts back into the legacy sidebar. */
   newSidebarEnabled: boolean
@@ -1197,6 +1224,21 @@ export interface AppSettingsSnapshot {
    * Absent from older servers; clients fall back to the static PROVIDERS.
    */
   availableProviders?: ProviderCatalogEntry[]
+  /**
+   * Server-computed, never persisted: which editors are actually installed on
+   * this machine, so the "Open in…" menus can grey out the rest instead of
+   * offering a click that fails. `null` while detection is still running (and
+   * from servers too old to send it) — treat that as "assume everything
+   * works" rather than disabling the whole menu.
+   */
+  installedEditors: EditorPreset[] | null
+  /**
+   * Server-computed, never persisted: the terminal emulators found on this
+   * machine, so "Open in…" offers the one you actually use. `null` while
+   * detection runs, and from servers too old to send it — in which case the
+   * menu falls back to the single system-default Terminal entry.
+   */
+  installedTerminals: TerminalPreset[] | null
 }
 
 export interface AppSettingsPatch {
@@ -1205,6 +1247,8 @@ export interface AppSettingsPatch {
   theme?: AppThemePreference
   chatSoundPreference?: ChatSoundPreference
   chatSoundId?: ChatSoundId
+  chatBrowserNotificationPreference?: ChatBrowserNotificationPreference
+  submitWhileRunning?: SubmitWhileRunning
   newSidebarEnabled?: boolean
   newProjectsDirectory?: string
   setupShown?: boolean
@@ -2179,4 +2223,6 @@ export interface ResolvedChatReadAnchor {
 export interface PendingToolSnapshot {
   toolUseId: string
   toolKind: "ask_user_question" | "exit_plan_mode"
+  /** One line of what the tool is asking; see `SidebarChatRow.pendingUserInputPreview`. */
+  preview?: string
 }

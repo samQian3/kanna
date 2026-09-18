@@ -19,9 +19,10 @@ import type {
   UpdateSnapshot,
   UsageLimitsSnapshot,
   EditorPreset,
+  TerminalPreset,
 } from "./types"
 
-export type { EditorPreset }
+export type { EditorPreset, TerminalPreset }
 
 export interface EditorOpenSettings {
   preset: EditorPreset
@@ -182,11 +183,14 @@ export type ClientCommand =
       line?: number
       column?: number
       editor?: EditorOpenSettings
+      /** For `open_terminal`: which emulator. Omitted means this machine's default. */
+      terminal?: TerminalPreset
     }
   | { type: "chat.create"; projectId: string }
   | { type: "chat.fork"; chatId: string }
   | { type: "chat.editPrevious"; chatId: string; messageId: string }
   | { type: "chat.rename"; chatId: string; title: string }
+  | { type: "chat.setPinned"; chatId: string; pinned: boolean }
   | { type: "chat.archive"; chatId: string }
   | { type: "chat.unarchive"; chatId: string }
   | { type: "chat.delete"; chatId: string }
@@ -303,6 +307,13 @@ export type ClientCommand =
       modelOptions?: ModelOptions
       planMode?: boolean
       autoPlan?: boolean
+      /**
+       * Interrupt the running turn and deliver this message now, instead of
+       * leaving it queued — the same as "Send now" on a queued message, folded
+       * into one command so the coordinator can absorb the turn ending in
+       * between (in which case the message has already started).
+       */
+      steer?: boolean
     }
   | {
       type: "message.steer"

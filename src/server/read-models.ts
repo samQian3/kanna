@@ -72,8 +72,11 @@ function canForkChat(
   // Cursor has no fork/branch primitive, so forking would silently start a fresh session.
   if (chat.provider === "cursor") return false
   if (!chat.sessionToken && !chat.pendingForkSessionToken) return false
-  if (activeStatuses.has(chat.id)) return false
-  if (drainingChatIds.has(chat.id)) return false
+  // A chat with a turn in flight forks from its last completed turn, so it
+  // needs one: a chat still inside its very first turn has no branch point.
+  if (activeStatuses.has(chat.id) || drainingChatIds.has(chat.id)) {
+    return chat.lastTurnEndedAt != null
+  }
   return true
 }
 
@@ -189,6 +192,8 @@ export function deriveSidebarData(
     sidebarProjectOrder?: string[]
     drainingChatIds?: Set<string>
     pendingToolKinds?: Map<string, string>
+    /** Question or plan text per waiting chat; only read for chats in `pendingToolKinds`. */
+    pendingUserInputPreviews?: Map<string, string>
     /** Per-project working-tree state, from `WorktreeProbe.getStates()`. */
     workingTrees?: ReadonlyMap<string, WorkingTreeProbe>
     /** Per-project repo/branch identity, from `WorktreeProbe.getRepoLabels()`. */
@@ -245,6 +250,7 @@ export function deriveSidebarData(
       .sort((a, b) => getSidebarChatSortTimestamp(b) - getSidebarChatSortTimestamp(a))
       .map((chat) => {
         const pendingToolKind = options?.pendingToolKinds?.get(chat.id)
+        const pendingUserInputPreview = pendingToolKind ? options?.pendingUserInputPreviews?.get(chat.id) : undefined
         // Chats that predate file tracking have no paths and so are never
         // flagged — the safe direction: they simply sit in their date bucket
         // until their next turn records something.
@@ -271,7 +277,10 @@ export function deriveSidebarData(
           // No message previews here: they change on every assistant message
           // and only the hover card reads them (`chat.getPreview`).
           ...(pendingToolKind ? { pendingToolKind } : {}),
+          ...(pendingUserInputPreview ? { pendingUserInputPreview } : {}),
           ...(uncommittedWork ? { uncommittedWork: true } : {}),
+          ...(chat.archivedAt ? { archivedAt: chat.archivedAt } : {}),
+          ...(chat.pinnedAt ? { pinnedAt: chat.pinnedAt } : {}),
           hasAutomation: false,
           canFork: canForkChat(chat, activeStatuses, drainingChatIds) || undefined,
         }

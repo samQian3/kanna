@@ -174,6 +174,47 @@ describe("read models", () => {
     expect(row!.lastAgentMessageAt! % SIDEBAR_ACTIVITY_RESOLUTION_MS).toBe(0)
   })
 
+  test("carries the pending question only for chats that are waiting", () => {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", {
+      id: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    state.projectIdsByPath.set("/tmp/project", "project-1")
+    state.chatsById.set("chat-1", {
+      id: "chat-1",
+      projectId: "project-1",
+      title: "Chat",
+      createdAt: 1,
+      updatedAt: 1,
+      unread: false,
+      provider: "codex",
+      planMode: false,
+      autoPlan: false,
+      sessionToken: "thread-1",
+      lastTurnOutcome: null,
+    })
+    const previews = new Map([["chat-1", "Which runtime should I use?"]])
+
+    const waiting = deriveSidebarData(state, new Map([["chat-1", "waiting_for_user"]]), {
+      nowMs: 1_000_000,
+      pendingToolKinds: new Map([["chat-1", "ask_user_question"]]),
+      pendingUserInputPreviews: previews,
+    })
+    expect(waiting.projectGroups[0]?.chats[0]?.pendingUserInputPreview).toBe("Which runtime should I use?")
+
+    // The router only fills the maps for waiting chats; a stale preview with
+    // no tool kind behind it must not leak onto an idle row.
+    const idle = deriveSidebarData(state, new Map([["chat-1", "idle"]]), {
+      nowMs: 1_000_000,
+      pendingUserInputPreviews: previews,
+    })
+    expect(idle.projectGroups[0]?.chats[0]?.pendingUserInputPreview).toBeUndefined()
+  })
+
   test("uses sidebar-only project titles without changing local project metadata", () => {
     const state = createEmptyState()
     state.projectsById.set("project-1", {
@@ -296,6 +337,7 @@ describe("read models", () => {
     expect(chat?.queuedMessages.map((message) => message.content)).toEqual(["follow up"])
     expect(chat?.availableProviders.length).toBeGreaterThan(1)
     expect(chat?.availableProviders.find((provider) => provider.id === "codex")?.models.map((model) => model.id)).toEqual([
+      "gpt-6-astra",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
@@ -556,7 +598,7 @@ describe("read models", () => {
     expect(sidebar.projectGroups[0]?.olderChats.map((chat) => chat.chatId)).toEqual([])
   })
 
-  test("disables forking for active and draining chats, but allows pending fork chats", () => {
+  test("forks a busy chat only once it has a completed turn to branch from", () => {
     const state = createEmptyState()
     state.projectsById.set("project-1", {
       id: "project-1",
@@ -619,14 +661,31 @@ describe("read models", () => {
       sessionToken: "cursor-session",
       lastTurnOutcome: null,
     })
+    // Busy, but with a settled turn behind it — the fork branches from there.
+    state.chatsById.set("chat-active-again", {
+      id: "chat-active-again",
+      projectId: "project-1",
+      title: "Active again",
+      createdAt: 5,
+      updatedAt: 5,
+      unread: false,
+      provider: "claude",
+      planMode: false,
+      autoPlan: false,
+      sessionToken: "session-active-again",
+      lastTurnEndedAt: 4,
+      lastTurnOutcome: "success",
+    })
 
     const sidebar = deriveSidebarData(
       state,
-      new Map([["chat-active", "running"]]),
+      new Map([["chat-active", "running"], ["chat-active-again", "running"]]),
       { drainingChatIds: new Set(["chat-draining"]) }
     )
 
+    // Still inside its first turn: nothing settled to branch from.
     expect(sidebar.projectGroups[0]?.chats.find((chat) => chat.chatId === "chat-active")?.canFork).toBeUndefined()
+    expect(sidebar.projectGroups[0]?.chats.find((chat) => chat.chatId === "chat-active-again")?.canFork).toBe(true)
     expect(sidebar.projectGroups[0]?.chats.find((chat) => chat.chatId === "chat-pending")?.canFork).toBe(true)
     expect(sidebar.projectGroups[0]?.chats.find((chat) => chat.chatId === "chat-draining")?.canFork).toBeUndefined()
     // Cursor has no fork primitive, so forking is disabled even with a live session.

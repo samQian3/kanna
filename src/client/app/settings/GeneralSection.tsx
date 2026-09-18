@@ -4,8 +4,9 @@ import { useEffect, useState } from "react"
 import { Monitor, Moon, Sun } from "lucide-react"
 import { ANALYTICS_STATIC_EVENT_NAMES, ANALYTICS_STATIC_PROPERTY_NAMES } from "../../../shared/analytics"
 import type { EditorPreset } from "../../../shared/protocol"
-import { DEFAULT_NEW_PROJECTS_DIRECTORY } from "../../../shared/types"
+import { DEFAULT_NEW_PROJECTS_DIRECTORY, type SubmitWhileRunning } from "../../../shared/types"
 import { EDITOR_OPTIONS, EditorIcon } from "../../components/editor-icons"
+import { useInstalledEditors } from "../../components/open-external-menu"
 import { Button } from "../../components/ui/button"
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogTitle } from "../../components/ui/dialog"
 import { Input } from "../../components/ui/input"
@@ -30,7 +31,14 @@ import {
   getDefaultEditorCommandTemplate,
   useTerminalPreferencesStore,
 } from "../../stores/terminalPreferencesStore"
-import { CHAT_SOUND_OPTIONS, useChatSoundPreferencesStore, type ChatSoundId, type ChatSoundPreference } from "../../stores/chatSoundPreferencesStore"
+import {
+  CHAT_SOUND_OPTIONS,
+  useChatSoundPreferencesStore,
+  type ChatBrowserNotificationPreference,
+  type ChatSoundId,
+  type ChatSoundPreference,
+} from "../../stores/chatSoundPreferencesStore"
+import { requestChatBrowserNotificationPermission } from "../../lib/chatBrowserNotifications"
 import {
   DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES,
   MAX_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES,
@@ -40,6 +48,7 @@ import type { KannaState } from "../useKannaState"
 import {
   ENABLED_DISABLED_OPTIONS,
   handleSettingsInputKeyDown,
+  resolveChatBrowserNotificationPreferenceAfterPermission,
   SettingsErrorBanner,
   SettingsRow,
   shouldPreviewChatSoundChange,
@@ -53,6 +62,12 @@ const themeOptions = [
 ]
 
 const chatSoundPreferenceOptions: { value: ChatSoundPreference; label: string }[] = [
+  { value: "never", label: "Never" },
+  { value: "unfocused", label: "When Unfocused" },
+  { value: "always", label: "Always" },
+]
+
+const chatBrowserNotificationPreferenceOptions: { value: ChatBrowserNotificationPreference; label: string }[] = [
   { value: "never", label: "Never" },
   { value: "unfocused", label: "When Unfocused" },
   { value: "always", label: "Always" },
@@ -73,6 +88,7 @@ export function GeneralSection({
   const scrollbackLines = useTerminalPreferencesStore((store) => store.scrollbackLines)
   const minColumnWidth = useTerminalPreferencesStore((store) => store.minColumnWidth)
   const editorPreset = useTerminalPreferencesStore((store) => store.editorPreset)
+  const installedEditors = useInstalledEditors()
   const editorCommandTemplate = useTerminalPreferencesStore((store) => store.editorCommandTemplate)
   const setScrollbackLines = useTerminalPreferencesStore((store) => store.setScrollbackLines)
   const setMinColumnWidth = useTerminalPreferencesStore((store) => store.setMinColumnWidth)
@@ -82,12 +98,15 @@ export function GeneralSection({
   const chatSoundId = useChatSoundPreferencesStore((store) => store.chatSoundId)
   const setChatSoundPreference = useChatSoundPreferencesStore((store) => store.setChatSoundPreference)
   const setChatSoundId = useChatSoundPreferencesStore((store) => store.setChatSoundId)
+  const chatBrowserNotificationPreference = useChatSoundPreferencesStore((store) => store.chatBrowserNotificationPreference)
+  const setChatBrowserNotificationPreference = useChatSoundPreferencesStore((store) => store.setChatBrowserNotificationPreference)
 
   const [scrollbackDraft, setScrollbackDraft] = useState(String(scrollbackLines))
   const [minColumnWidthDraft, setMinColumnWidthDraft] = useState(String(minColumnWidth))
   const [editorCommandDraft, setEditorCommandDraft] = useState(editorCommandTemplate)
   const newProjectsDirectory = appSettings?.newProjectsDirectory ?? DEFAULT_NEW_PROJECTS_DIRECTORY
   const [newProjectsDirectoryDraft, setNewProjectsDirectoryDraft] = useState(newProjectsDirectory)
+  const submitWhileRunning = appSettings?.submitWhileRunning ?? "queue"
   const transcriptWindow = appSettings?.transcript?.windowAssistantMessages ?? DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES
   const [transcriptWindowDraft, setTranscriptWindowDraft] = useState(String(transcriptWindow))
   const [appSettingsError, setAppSettingsError] = useState<string | null>(null)
@@ -226,6 +245,29 @@ export function GeneralSection({
     void playChatNotificationSound(nextValue, 1).catch(() => undefined)
   }
 
+  function handleChatBrowserNotificationPreferenceChange(nextValue: ChatBrowserNotificationPreference) {
+    if (chatBrowserNotificationPreference === nextValue) {
+      return
+    }
+
+    // The permission prompt is the browser's, and it only appears here, on the
+    // user's own click. A denied or unsupported prompt drops the setting back
+    // to Never rather than saving an option that would never fire.
+    void (async () => {
+      try {
+        const permission = nextValue === "never" ? "granted" : await requestChatBrowserNotificationPermission()
+        const resolvedPreference = resolveChatBrowserNotificationPreferenceAfterPermission(nextValue, permission)
+        setChatBrowserNotificationPreference(resolvedPreference)
+        await handleWriteAppSettings({ chatBrowserNotificationPreference: resolvedPreference })
+        if (nextValue !== "never" && resolvedPreference === "never") {
+          setAppSettingsError("Browser notifications are blocked or unsupported in this browser.")
+        }
+      } catch (error) {
+        setAppSettingsError(error instanceof Error ? error.message : "Unable to save chat notification settings.")
+      }
+    })()
+  }
+
   async function handleAnalyticsPreferenceChange(nextValue: "enabled" | "disabled") {
     try {
       setAppSettingsError(null)
@@ -324,6 +366,47 @@ export function GeneralSection({
           </Select>
         </SettingsRow>
 
+        <SettingsRow def={SETTINGS_ROWS.chatBrowserNotifications}>
+          <Select
+            value={chatBrowserNotificationPreference}
+            onValueChange={(value) => handleChatBrowserNotificationPreferenceChange(value as ChatBrowserNotificationPreference)}
+          >
+            <SelectTrigger className="min-w-[180px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {chatBrowserNotificationPreferenceOptions.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+
+        <SettingsRow def={SETTINGS_ROWS.submitWhileRunning}>
+          <Select
+            value={submitWhileRunning}
+            onValueChange={(value) => {
+              void handleWriteAppSettings({ submitWhileRunning: value as SubmitWhileRunning }).catch((error) => {
+                setAppSettingsError(error instanceof Error ? error.message : "Unable to save composer settings.")
+              })
+            }}
+          >
+            <SelectTrigger className="min-w-[180px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="queue">Queue message</SelectItem>
+                <SelectItem value="steer">Steer now</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+
         <SettingsRow def={SETTINGS_ROWS.defaultEditor} alignStart>
           <Select
             value={editorPreset}
@@ -334,14 +417,24 @@ export function GeneralSection({
             </SelectTrigger>
             <SelectContent>
               <SelectGroup>
-                {EDITOR_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    <span className="flex items-center gap-2">
-                      <EditorIcon preset={option.value} className="h-4 w-4 shrink-0" />
-                      <span>{option.label}</span>
-                    </span>
-                  </SelectItem>
-                ))}
+                {EDITOR_OPTIONS.map((option) => {
+                  // Listed but not selectable when it isn't on this machine —
+                  // picking it would only make every "Open in" fail later.
+                  const installed = !installedEditors || option.value === "custom" || installedEditors.includes(option.value)
+                  return (
+                    <SelectItem key={option.value} value={option.value} disabled={!installed}>
+                      <span className="flex items-center gap-2">
+                        <EditorIcon preset={option.value} className={`h-4 w-4 shrink-0${installed ? "" : " opacity-40 grayscale"}`} />
+                        <span className={installed ? undefined : "text-muted-foreground"}>{option.label}</span>
+                        {installed ? null : (
+                          <span className="ml-auto shrink-0 rounded-full border border-border/70 px-1.5 py-px text-[10px] leading-4 font-medium text-muted-foreground">
+                            Not installed
+                          </span>
+                        )}
+                      </span>
+                    </SelectItem>
+                  )
+                })}
               </SelectGroup>
             </SelectContent>
           </Select>

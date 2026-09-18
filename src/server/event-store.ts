@@ -1,4 +1,5 @@
-import { appendFile, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises"
+import type { PerformanceLog } from "./performance-log"
+import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { existsSync, readFileSync as readFileSyncImmediate } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -10,6 +11,7 @@ import type { AgentProvider, QueuedChatMessage, ResolvedChatReadAnchor, Transcri
 import { STORE_VERSION } from "../shared/types"
 import {
   type ChatEvent,
+  type ChatRecord,
   type ProjectEvent,
   type QueuedMessageEvent,
   type SnapshotFile,
@@ -22,6 +24,9 @@ import {
   createEmptyState,
 } from "./events"
 import { resolveLocalPath } from "./paths"
+// The sidebar's own quantization, imported rather than duplicated so the two
+// cannot drift: if the wire resolution changes, this bump condition follows.
+import { SIDEBAR_ACTIVITY_RESOLUTION_MS } from "./read-models"
 import { slimTranscriptFile } from "./transcript-slim"
 import {
   mergeTranscriptPayload,
@@ -152,6 +157,56 @@ function isAgentAuthoredEntry(entry: TranscriptEntry) {
     || entry.kind === "result"
 }
 
+/**
+ * Index just past the last completed turn in a transcript, or 0 when no turn
+ * has finished yet. A turn closes with a `result` entry, or with `interrupted`
+ * when it was cancelled (Claude emits that instead of a result), so everything
+ * after the last of those belongs to a turn still in flight.
+ *
+ * Used to fork a chat mid-turn: the fork branches from the last settled point
+ * rather than inheriting a turn whose tool calls have no results yet.
+ */
+export function findLastCompletedTurnEnd(entries: TranscriptEntry[]) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const kind = entries[index]!.kind
+    if (kind === "result" || kind === "interrupted") return index + 1
+  }
+  return 0
+}
+
+/**
+ * Re-derive the sidebar preview fields from a fork's copied transcript. Forks
+ * of an idle chat inherit these from the source record instead (it is the same
+ * conversation), but a fork taken mid-turn drops the running turn, so the
+ * source's fields would advertise a prompt the fork does not contain.
+ *
+ * Mirrors `applyMessageMetadata`, which derives the same fields on append.
+ */
+function summarizeForkedTranscript(entries: TranscriptEntry[]) {
+  const summary: {
+    lastUserMessagePreview?: string
+    lastAgentMessagePreview?: string
+    lastAgentMessagePreviewAt?: number
+    lastAgentMessageAt?: number
+  } = {}
+  for (const entry of entries) {
+    if (entry.kind === "user_prompt" && !entry.hidden) {
+      const preview = buildChatMessagePreview(entry.content)
+      if (preview) summary.lastUserMessagePreview = preview
+    } else if (entry.kind === "assistant_text" && !entry.hidden) {
+      const preview = buildChatMessagePreview(entry.text)
+      if (preview) {
+        summary.lastAgentMessagePreview = preview
+        summary.lastAgentMessagePreviewAt = entry.createdAt
+      }
+    }
+    if (isAgentAuthoredEntry(entry)) {
+      summary.lastAgentMessageAt = Math.max(summary.lastAgentMessageAt ?? 0, entry.createdAt)
+    }
+  }
+  return summary
+}
+
 function normalizeSidebarProjectOrder(value: unknown) {
   if (!Array.isArray(value)) {
     return []
@@ -210,6 +265,7 @@ function getReplayEventPriority(event: StoreEvent) {
     case "pending_fork_session_token_set":
       return 6
     case "turn_cancelled":
+    case "turn_resume_pending_set":
       return 7
     case "turn_finished":
     case "turn_failed":
@@ -220,6 +276,7 @@ function getReplayEventPriority(event: StoreEvent) {
     case "chat_files_touched":
     case "chat_last_message_at_set":
       return 9
+    case "chat_pin_set":
     case "chat_deleted":
     case "chat_archived":
     case "chat_unarchived":
@@ -262,11 +319,13 @@ export class EventStore {
   private legacySidebarProjectOrder: string[] = []
   private sidebarProjectOrder: string[] = []
   private snapshotHasLegacyMessages = false
-  // Small LRU of hot transcripts. One slot used to thrash badly: any read of
-  // another chat (board view, prune sweep) evicted the actively streaming
-  // chat, forcing a synchronous full-file re-read on its next event.
+  // A byte budget avoids eviction on every read when several chats stay open.
   private readonly transcriptCache = new Map<string, TranscriptEntry[]>()
-  private static readonly TRANSCRIPT_CACHE_LIMIT = 8
+  private static readonly TRANSCRIPT_CACHE_LIMIT = 256
+  private static readonly TRANSCRIPT_CACHE_BYTES = 128 * 1024 * 1024
+  private readonly transcriptBytes = new Map<string, number>()
+  private readonly transcriptLoads = new Map<string, Promise<void>>()
+  private queuedWrites = 0
   /**
    * Offsets into each chat's payload sidecar (`transcript-payloads.ts`).
    * Built on first payload read, evicted with the transcript cache.
@@ -284,7 +343,7 @@ export class EventStore {
    */
   onTurnStarted?: (chatId: string) => void
 
-  constructor(dataDir = getDataDir(homedir())) {
+  constructor(dataDir = getDataDir(homedir()), private readonly diagnostics?: PerformanceLog) {
     this.dataDir = dataDir
     this.snapshotPath = path.join(this.dataDir, "snapshot.json")
     this.projectsLogPath = path.join(this.dataDir, "projects.jsonl")
@@ -464,6 +523,7 @@ export class EventStore {
     this.sidebarProjectOrder = []
     this.legacySidebarProjectOrder = []
     this.transcriptCache.clear()
+    this.transcriptBytes.clear()
     this.payloadIndexes.clear()
   }
 
@@ -625,8 +685,10 @@ export class EventStore {
 
   /**
    * Bumped on every change that can move a sidebar row: applied events,
-   * transcript metadata, project order, a reset. Read models memoize on it,
-   * so a broadcast that changed nothing here skips the derive entirely.
+   * project order, a reset, and transcript appends — the last only when they
+   * moved something the sidebar can actually show (`sidebarVisibleSignature`).
+   * Read models memoize on it, so a broadcast that changed nothing here skips
+   * the derive entirely.
    */
   stateVersion = 0
 
@@ -687,6 +749,14 @@ export class EventStore {
         this.state.chatsById.set(chat.id, chat)
         break
       }
+      case "chat_pin_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        if (event.pinned) chat.pinnedAt = event.timestamp
+        else delete chat.pinnedAt
+        chat.updatedAt = event.timestamp
+        break
+      }
       case "chat_renamed": {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
@@ -705,6 +775,7 @@ export class EventStore {
       case "chat_archived": {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
+        delete chat.pinnedAt
         chat.archivedAt = event.timestamp
         chat.updatedAt = event.timestamp
         break
@@ -861,6 +932,16 @@ export class EventStore {
         chat.lastTurnEndedAt = event.timestamp
         break
       }
+      case "turn_resume_pending_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        if (event.pending) {
+          chat.resumePending = true
+        } else {
+          delete chat.resumePending
+        }
+        break
+      }
       case "session_token_set": {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
@@ -878,10 +959,35 @@ export class EventStore {
     }
   }
 
+  /**
+   * The part of a chat the sidebar snapshot can actually show.
+   *
+   * `applyMessageMetadata` touches seven fields, but the sidebar reads only
+   * three: `hasMessages` (its archived-chat filter), `lastMessageAt` (sort key,
+   * row field, recent/older bucket) and `lastAgentMessageAt` — the last one
+   * quantized, so sub-15s movement is invisible on the wire. The previews and
+   * `updatedAt` never reach the sidebar at all; the hover card fetches previews
+   * through a separate command.
+   */
+  private sidebarVisibleSignature(chat: ChatRecord) {
+    const activityBucket = chat.lastAgentMessageAt == null
+      ? ""
+      : Math.floor(chat.lastAgentMessageAt / SIDEBAR_ACTIVITY_RESOLUTION_MS)
+    return `${chat.hasMessages}|${chat.lastMessageAt ?? ""}|${activityBucket}`
+  }
+
   private applyMessageMetadata(chatId: string, entry: TranscriptEntry) {
-    this.stateVersion += 1
     const chat = this.state.chatsById.get(chatId)
-    if (!chat) return
+    if (!chat) {
+      // No chat to compare against; keep the unconditional bump.
+      this.stateVersion += 1
+      return
+    }
+    // `stateVersion` has exactly one consumer: the sidebar memo key in
+    // ws-router. Bumping it per appended entry made a streaming turn re-derive
+    // the whole sidebar and stringify the whole snapshot many times a second,
+    // only for the signature compare to drop the push as byte-identical.
+    const sidebarBefore = this.sidebarVisibleSignature(chat)
     chat.hasMessages = true
     if (entry.kind === "user_prompt") {
       // Monotonic, like `lastAgentMessageAt` below and like the logged stamp
@@ -911,15 +1017,103 @@ export class EventStore {
       chat.lastAgentMessageAt = Math.max(chat.lastAgentMessageAt ?? 0, entry.createdAt)
     }
     chat.updatedAt = Math.max(chat.updatedAt, entry.createdAt)
+    if (this.sidebarVisibleSignature(chat) !== sidebarBefore) {
+      this.stateVersion += 1
+    }
+  }
+
+  private enqueueWrite(run: () => Promise<void>) {
+    const queuedAt = performance.now()
+    this.queuedWrites += 1
+    const write = this.writeChain.then(async () => {
+      this.diagnostics?.record("store_queue_wait_ms", performance.now() - queuedAt)
+      try {
+        await run()
+      } finally {
+        this.queuedWrites -= 1
+      }
+    })
+    // The caller receives its error. Later writes still get their own attempt.
+    this.writeChain = write.catch(() => { this.diagnostics?.record("store_write_errors") })
+    return write
+  }
+
+  getResourceCounts() {
+    return {
+      transcriptCaches: this.transcriptCache.size,
+      transcriptCacheEstimatedBytes: [...this.transcriptBytes.values()].reduce((sum, size) => sum + size, 0),
+      transcriptCacheEntries: [...this.transcriptCache.values()].reduce((sum, entries) => sum + entries.length, 0),
+      transcriptLoads: this.transcriptLoads.size,
+      payloadIndexes: this.payloadIndexes.size,
+      storeQueuedWrites: this.queuedWrites,
+    }
+  }
+
+  /** Reads share the write queue so a partial append cannot enter the cache. */
+  prepareTranscript(chatId: string): Promise<void> {
+    if (this.transcriptCache.has(chatId)) return Promise.resolve()
+    const pending = this.transcriptLoads.get(chatId)
+    if (pending) return pending
+    const load = this.enqueueWrite(async () => { await this.loadTranscriptAsync(chatId) })
+      .finally(() => { this.transcriptLoads.delete(chatId) })
+    this.transcriptLoads.set(chatId, load)
+    return load
+  }
+
+  private async loadTranscriptAsync(chatId: string) {
+    if (this.transcriptCache.has(chatId)) return
+    const started = performance.now()
+    const legacy = this.legacyMessagesByChatId.get(chatId)
+    if (legacy) {
+      this.setCachedTranscript(chatId, cloneTranscriptEntries(legacy))
+      return
+    }
+    let text: string
+    try {
+      text = await readFile(this.transcriptPath(chatId), "utf8")
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      text = ""
+    }
+    const entries: TranscriptEntry[] = []
+    let start = 0
+    let sliceStarted = performance.now()
+    while (start < text.length) {
+      const newline = text.indexOf("\n", start)
+      const end = newline === -1 ? text.length : newline
+      const line = text.slice(start, end).trim()
+      if (line) entries.push(JSON.parse(line) as TranscriptEntry)
+      start = end + 1
+      if (performance.now() - sliceStarted >= 4) {
+        await new Promise<void>(resolve => setImmediate(resolve))
+        sliceStarted = performance.now()
+      }
+    }
+    this.setCachedTranscript(chatId, entries, text.length * 2 + entries.length * 512)
+    this.diagnostics?.record("transcript_async_load_ms", performance.now() - started)
+    this.diagnostics?.record("transcript_disk_bytes", text.length)
+  }
+
+  getRollingTranscriptWindowStart(chatId: string, currentStart: number, assistantMessages: number) {
+    const entries = this.getTranscriptEntries(chatId)
+    const start = findTranscriptWindowStart(entries, {
+      endExclusive: entries.length,
+      assistantMessages: assistantMessages * 2,
+    })
+    return Math.max(currentStart, start)
+  }
+
+  getTranscriptLength(chatId: string) {
+    return this.getTranscriptEntries(chatId).length
   }
 
   private append<TEvent extends StoreEvent>(filePath: string, event: TEvent) {
     const payload = `${JSON.stringify(event)}\n`
-    this.writeChain = this.writeChain.then(async () => {
+    const write = this.enqueueWrite(async () => {
       await appendFile(filePath, payload, "utf8")
       this.applyEvent(event)
     })
-    return this.writeChain
+    return write
   }
 
   private transcriptPath(chatId: string) {
@@ -933,7 +1127,7 @@ export class EventStore {
   private getPayloadIndex(chatId: string) {
     const cached = this.payloadIndexes.get(chatId)
     if (cached) return cached
-    while (this.payloadIndexes.size >= EventStore.TRANSCRIPT_CACHE_LIMIT) {
+    while (this.payloadIndexes.size >= 16) {
       const oldest = this.payloadIndexes.keys().next().value
       if (oldest === undefined) break
       this.payloadIndexes.delete(oldest)
@@ -961,6 +1155,7 @@ export class EventStore {
 
   private dropTranscriptCaches(chatId: string) {
     this.transcriptCache.delete(chatId)
+    this.transcriptBytes.delete(chatId)
     this.payloadIndexes.delete(chatId)
   }
 
@@ -1018,14 +1213,23 @@ export class EventStore {
     return entries
   }
 
-  private setCachedTranscript(chatId: string, entries: TranscriptEntry[]) {
+  private setCachedTranscript(chatId: string, entries: TranscriptEntry[], estimatedBytes?: number) {
     this.transcriptCache.delete(chatId)
-    while (this.transcriptCache.size >= EventStore.TRANSCRIPT_CACHE_LIMIT) {
-      const oldest = this.transcriptCache.keys().next().value
-      if (oldest === undefined) break
-      this.transcriptCache.delete(oldest)
-    }
     this.transcriptCache.set(chatId, entries)
+    this.transcriptBytes.set(chatId, estimatedBytes ?? JSON.stringify(entries).length * 2 + entries.length * 512)
+    this.trimTranscriptCache(chatId)
+  }
+
+  private trimTranscriptCache(keepChatId: string) {
+    let bytes = [...this.transcriptBytes.values()].reduce((sum, size) => sum + size, 0)
+    for (const oldest of this.transcriptCache.keys()) {
+      if (this.transcriptCache.size <= EventStore.TRANSCRIPT_CACHE_LIMIT && bytes <= EventStore.TRANSCRIPT_CACHE_BYTES) break
+      // One large transcript must remain usable until its reader finishes.
+      if (oldest === keepChatId) continue
+      bytes -= this.transcriptBytes.get(oldest) ?? 0
+      this.dropTranscriptCaches(oldest)
+      this.diagnostics?.record("transcript_cache_evictions")
+    }
   }
 
   private loadTranscriptFromDisk(chatId: string) {
@@ -1034,6 +1238,7 @@ export class EventStore {
       return []
     }
 
+    const started = performance.now()
     const text = readFileSyncImmediate(transcriptPath, "utf8")
     if (!text.trim()) return []
 
@@ -1043,6 +1248,7 @@ export class EventStore {
       if (!line) continue
       entries.push(JSON.parse(line) as TranscriptEntry)
     }
+    this.diagnostics?.record("transcript_sync_load_ms", performance.now() - started)
     return entries
   }
 
@@ -1121,11 +1327,11 @@ export class EventStore {
       return
     }
 
-    this.writeChain = this.writeChain.then(async () => {
+    const write = this.enqueueWrite(async () => {
       await this.writeSidebarProjectOrderFile(uniqueProjectIds)
       this.sidebarProjectOrder = [...uniqueProjectIds]
     })
-    return this.writeChain
+    return write
   }
 
   async createChat(projectId: string) {
@@ -1160,12 +1366,48 @@ export class EventStore {
     return {chatId:chat.id}
   }
 
-  async forkChat(sourceChatId: string) {
+  /**
+   * Copy a chat into a new one that resumes the same native session.
+   *
+   * `atLastCompletedTurn` trims the copied transcript to the last settled turn.
+   * That is how a chat with a turn in flight is forked: the fork starts from a
+   * conversation whose tool calls all have their results, and the source keeps
+   * running undisturbed.
+   */
+  async forkChat(sourceChatId: string, options?: { atLastCompletedTurn?: boolean }) {
     const sourceChat = this.requireChat(sourceChatId)
     const sourceSessionToken = sourceChat.sessionToken ?? sourceChat.pendingForkSessionToken ?? null
     if (!sourceChat.provider || !sourceSessionToken) {
       throw new Error("Chat cannot be forked")
     }
+
+    // Resolved before anything is written: a mid-turn fork of a chat whose
+    // first turn is still running has no settled branch point, and refusing
+    // here means it leaves no half-built chat behind.
+    const allEntries = this.getMessages(sourceChatId)
+    const branchPoint = options?.atLastCompletedTurn
+      ? findLastCompletedTurnEnd(allEntries)
+      : allEntries.length
+    if (branchPoint === 0 && allEntries.length > 0) {
+      throw new Error("Chat has no completed turn to fork from yet")
+    }
+    const droppedRunningTurn = branchPoint < allEntries.length
+
+    // A fork of an idle chat inherits these from the source record — same
+    // conversation, so the same counts and previews. A fork taken mid-turn left
+    // that turn behind, so its numbers come from the copied transcript instead.
+    const inherited = droppedRunningTurn
+      ? {
+          turnCount: Math.max(0, (sourceChat.turnCount ?? 0) - 1),
+          ...summarizeForkedTranscript(allEntries.slice(0, branchPoint)),
+        }
+      : {
+          turnCount: sourceChat.turnCount,
+          lastUserMessagePreview: sourceChat.lastUserMessagePreview,
+          lastAgentMessagePreview: sourceChat.lastAgentMessagePreview,
+          lastAgentMessagePreviewAt: sourceChat.lastAgentMessagePreviewAt,
+          lastAgentMessageAt: sourceChat.lastAgentMessageAt,
+        }
 
     const chatId = crypto.randomUUID()
     const createdAt = Date.now()
@@ -1197,12 +1439,13 @@ export class EventStore {
 
     // The fork gets its own copy of any images, and its entries point at
     // that copy, so deleting the source later does not blank its screenshots.
-    const sourceEntries = this.getMessages(sourceChatId)
+    const sourceEntries = allEntries
+      .slice(0, branchPoint)
       .map((entry) => retargetEntryMediaUrls(entry, sourceChatId, chatId))
     if (sourceEntries.length > 0) {
       const transcriptPath = this.transcriptPath(chatId)
       const payload = sourceEntries.map((entry) => JSON.stringify(entry)).join("\n")
-      this.writeChain = this.writeChain.then(async () => {
+      const write = this.enqueueWrite(async () => {
         await this.ensureTranscriptsDir()
         await copyTranscriptMedia(this.dataDir, sourceChatId, chatId)
         // `getMessages` merged the payloads back in, so the fork's transcript
@@ -1216,21 +1459,21 @@ export class EventStore {
           // The fork's conversation *is* the source's, so it inherits its turns
           // too — a fork of a twenty-turn chat has twenty turns behind it, and
           // starting the count from zero would read as a fresh chat.
-          if (sourceChat.turnCount) chat.turnCount = sourceChat.turnCount
-          if (sourceChat.lastUserMessagePreview) chat.lastUserMessagePreview = sourceChat.lastUserMessagePreview
-          if (sourceChat.lastAgentMessagePreview) {
-            chat.lastAgentMessagePreview = sourceChat.lastAgentMessagePreview
-            chat.lastAgentMessagePreviewAt = sourceChat.lastAgentMessagePreviewAt
+          if (inherited.turnCount) chat.turnCount = inherited.turnCount
+          if (inherited.lastUserMessagePreview) chat.lastUserMessagePreview = inherited.lastUserMessagePreview
+          if (inherited.lastAgentMessagePreview) {
+            chat.lastAgentMessagePreview = inherited.lastAgentMessagePreview
+            chat.lastAgentMessagePreviewAt = inherited.lastAgentMessagePreviewAt
           }
           // Same transcript, so the same last-agent-activity timestamp a
           // reload would derive from it.
-          if (sourceChat.lastAgentMessageAt != null) {
-            chat.lastAgentMessageAt = Math.max(chat.lastAgentMessageAt ?? 0, sourceChat.lastAgentMessageAt)
+          if (inherited.lastAgentMessageAt != null) {
+            chat.lastAgentMessageAt = Math.max(chat.lastAgentMessageAt ?? 0, inherited.lastAgentMessageAt)
           }
         }
         this.setCachedTranscript(chatId, cloneTranscriptEntries(sourceEntries))
       })
-      await this.writeChain
+      await write
       // The fork inherits the copied conversation's recency: without a
       // `lastMessageAt` it reads as an empty draft and stays hidden from every
       // recency-driven sidebar section until its first new message. Set by the
@@ -1266,6 +1509,19 @@ export class EventStore {
       type: "chat_deleted",
       timestamp: Date.now(),
       chatId,
+    }
+    await this.append(this.chatsLogPath, event)
+  }
+
+  async setChatPinned(chatId: string, pinned: boolean) {
+    const chat = this.requireChat(chatId)
+    if (chat.deletedAt || chat.archivedAt || Boolean(chat.pinnedAt) === pinned) return
+    const event: ChatEvent = {
+      v: STORE_VERSION,
+      type: "chat_pin_set",
+      timestamp: Date.now(),
+      chatId,
+      pinned,
     }
     await this.append(this.chatsLogPath, event)
   }
@@ -1307,7 +1563,7 @@ export class EventStore {
     const prunedChatIds: string[] = []
 
     for (const chat of this.state.chatsById.values()) {
-      if (chat.deletedAt || chat.archivedAt || protectedChatIds.has(chat.id)) continue
+      if (chat.deletedAt || chat.archivedAt || chat.pinnedAt || protectedChatIds.has(chat.id)) continue
       if (now - chat.createdAt < maxAgeMs) continue
       if (chat.hasMessages) continue
       // Peek without inserting into the transcript cache — the prune sweep
@@ -1377,7 +1633,7 @@ export class EventStore {
     const archivedChatIds: string[] = []
 
     for (const chat of this.state.chatsById.values()) {
-      if (chat.deletedAt || chat.archivedAt || protectedChatIds.has(chat.id)) continue
+      if (chat.deletedAt || chat.archivedAt || chat.pinnedAt || protectedChatIds.has(chat.id)) continue
       // Empty chats are the prune sweep's job (hard delete), not ours.
       if (!chat.hasMessages && chat.lastMessageAt == null) continue
       const lastActivityAt = chat.lastMessageAt ?? chat.createdAt
@@ -1419,7 +1675,7 @@ export class EventStore {
     const deletedChatIds: string[] = []
 
     for (const chat of this.state.chatsById.values()) {
-      if (chat.deletedAt || protectedChatIds.has(chat.id)) continue
+      if (chat.deletedAt || chat.pinnedAt || protectedChatIds.has(chat.id)) continue
       const lastActivityAt = chat.lastMessageAt ?? chat.createdAt
       if (reference - lastActivityAt < maxAgeMs) continue
 
@@ -1672,10 +1928,11 @@ export class EventStore {
       await this.recordLastMessageAt(chatId, entry.createdAt)
     }
     const transcriptPath = this.transcriptPath(chatId)
-    this.writeChain = this.writeChain.then(async () => {
+    const write = this.enqueueWrite(async () => {
       await this.ensureTranscriptsDir()
       // Bytes the header points at go to disk first (image files, then the
       // payload line), so a header on disk never names something missing.
+      if (entry.kind === "tool_result" && !entry.trimmed) await this.loadTranscriptAsync(chatId)
       const stored = await externalizeEntryImages(entry, { dataDir: this.dataDir, chatId })
       const { header, payload } = splitTranscriptEntry(stored, (toolId) => this.isInlineResult(chatId, toolId))
       if (payload) {
@@ -1690,8 +1947,12 @@ export class EventStore {
       // byte-identical to what a cold disk read would produce, and callers
       // that keep mutating their entry can't alias into the cache.
       this.transcriptCache.get(chatId)?.push(JSON.parse(headerLine) as TranscriptEntry)
+      if (this.transcriptCache.has(chatId)) {
+        this.transcriptBytes.set(chatId, (this.transcriptBytes.get(chatId) ?? 0) + headerLine.length * 2 + 512)
+        this.trimTranscriptCache(chatId)
+      }
     })
-    return this.writeChain
+    return write
   }
 
   async enqueueMessage(chatId: string, message: Omit<QueuedChatMessage, "id" | "createdAt"> & Partial<Pick<QueuedChatMessage, "id" | "createdAt">>) {
@@ -1839,6 +2100,25 @@ export class EventStore {
     }
     await this.append(this.turnsLogPath, event)
     this.onTurnEnded?.(chatId)
+  }
+
+  /**
+   * Flag (or clear) a chat whose turn Kanna cut short by shutting down, so the
+   * next process can pick it back up. Deliberately does not touch `updatedAt`:
+   * it's bookkeeping about the process, not activity in the chat, and bumping
+   * it would shuffle the sidebar on every boot.
+   */
+  async setTurnResumePending(chatId: string, pending: boolean) {
+    const chat = this.requireChat(chatId)
+    if (Boolean(chat.resumePending) === pending) return
+    const event: TurnEvent = {
+      v: STORE_VERSION,
+      type: "turn_resume_pending_set",
+      timestamp: Date.now(),
+      chatId,
+      pending,
+    }
+    await this.append(this.turnsLogPath, event)
   }
 
   async setSessionToken(chatId: string, sessionToken: string | null) {
@@ -2074,6 +2354,7 @@ export class EventStore {
     this.clearLegacyTranscriptState()
     await this.compact()
     this.transcriptCache.clear()
+    this.transcriptBytes.clear()
     this.payloadIndexes.clear()
     onProgress?.(`${LOG_PREFIX} transcript migration complete`)
     return true
@@ -2102,7 +2383,7 @@ export class EventStore {
       const chatId = name.slice(0, -".jsonl".length)
       const transcriptPath = path.join(this.transcriptsDir, name)
       stats.chats += 1
-      this.writeChain = this.writeChain.then(async () => {
+      const write = this.enqueueWrite(async () => {
         let result: Awaited<ReturnType<typeof slimTranscriptFile>>
         // Calls precede their results in a transcript, so this set is
         // complete by the time a result asks about its tool.
@@ -2133,7 +2414,7 @@ export class EventStore {
           `${LOG_PREFIX} transcript slim: ${name} ${formatMegabytes(result.bytesBefore)} → ${formatMegabytes(result.bytesAfter)}`
         )
       })
-      await this.writeChain
+      await write
     }
 
     await writeFile(this.slimMarkerPath, `${JSON.stringify({ version: SLIM_SWEEP_VERSION, completedAt: Date.now() })}\n`, "utf8")

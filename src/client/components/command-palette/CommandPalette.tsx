@@ -68,10 +68,9 @@ import { useChatHasDraft } from "../../stores/chatInputStore"
 import { useTerminalLayoutStore } from "../../stores/terminalLayoutStore"
 import { useTerminalPreferencesStore } from "../../stores/terminalPreferencesStore"
 import { PROVIDER_ICONS } from "../chat-ui/ChatPreferenceControls"
-import { projectActivity } from "../../app/kannaStateHelpers"
 import { ThreadRowContent } from "../chat-ui/ThreadRowContent"
 import { UsageSection } from "../../app/settings/UsageSection"
-import { getOpenAppItems, openAppValue, OpenAppIcon } from "../open-external-menu"
+import { getOpenAppItems, openAppValue, OpenAppIcon, useInstalledEditors, useInstalledTerminals } from "../open-external-menu"
 import {
   Command,
   CommandDialog,
@@ -275,6 +274,10 @@ export function CommandPalette({ state }: { state: KannaState }) {
   const browser = useDirectoryBrowser(state.socket)
 
   const editorPreset = useTerminalPreferencesStore((store) => store.editorPreset)
+  // Editors this machine doesn't have are dropped from the palette rather than
+  // listed disabled: every other row here is something you can run.
+  const installedEditors = useInstalledEditors()
+  const installedTerminals = useInstalledTerminals()
   const editorCommandTemplate = useTerminalPreferencesStore((store) => store.editorCommandTemplate)
 
   // The palette only ever flips between the two concrete themes, so it keys off
@@ -558,7 +561,7 @@ export function CommandPalette({ state }: { state: KannaState }) {
       })
     }
 
-    if (sidebarData.projectGroups.length > 0) {
+    if ((state.localProjects?.projects.length ?? 0) > 0) {
       list.push({
         id: "new-thread-choose",
         title: "New Chat in…",
@@ -732,8 +735,8 @@ export function CommandPalette({ state }: { state: KannaState }) {
       // and Windsurf are intentionally omitted here; a few icons are swapped
       // for palette-specific ones (harness Cursor glyph, folder-open, terminal).
       const CursorIcon = PROVIDER_ICONS.cursor
-      const openInItems = getOpenAppItems({ editorPreset, isMac, includeFinder: true, includeTerminal: true })
-        .filter((item) => item.value !== "editor:xcode" && item.value !== "editor:windsurf")
+      const openInItems = getOpenAppItems({ editorPreset, isMac, installedEditors, installedTerminals, includeFinder: true, includeTerminal: true })
+        .filter((item) => item.installed && item.value !== "editor:xcode" && item.value !== "editor:windsurf")
       for (const item of openInItems) {
         const icon = item.value === "editor:cursor"
           ? <CursorIcon className={ICON_CLASS} />
@@ -753,8 +756,8 @@ export function CommandPalette({ state }: { state: KannaState }) {
             openAppValue({
               value: item.value,
               editorCommandTemplate,
-              onOpenExternal: (action, editor) => {
-                void state.handleOpenExternal(action, editor)
+              onOpenExternal: (action, editor, terminal) => {
+                void state.handleOpenExternal(action, editor, terminal)
               },
             })
           },
@@ -981,6 +984,8 @@ export function CommandPalette({ state }: { state: KannaState }) {
     editorCommandTemplate,
     editorPreset,
     focusModeEnabled,
+    installedEditors,
+    installedTerminals,
     isMac,
     navigate,
     onChatPage,
@@ -1003,7 +1008,7 @@ export function CommandPalette({ state }: { state: KannaState }) {
     state.handleWriteAppSettings,
     state.keybindings,
     state.navbarLocalPath,
-    sidebarData.projectGroups.length,
+    state.localProjects?.projects.length,
   ])
 
   const trimmedQuery = query.trim()
@@ -1085,25 +1090,6 @@ export function CommandPalette({ state }: { state: KannaState }) {
       .map((entry) => entry.provider)
   }, [page, state.availableProviders, trimmedQuery])
 
-  // Same set as the new sidebar's Projects section (visible groups by recent
-  // activity), except the current project always leads — Enter with no query
-  // starts a chat where you already are. Typing re-ranks by fuzzy score.
-  const projectResults = useMemo(() => {
-    if (page !== "new-thread") return []
-    const groups = sidebarData.projectGroups
-      .filter((group) => group.chats.length > 0)
-      .sort((left, right) => projectActivity(right) - projectActivity(left))
-    if (!trimmedQuery) {
-      const current = projectId ? groups.find((group) => group.groupKey === projectId) : undefined
-      return current ? [current, ...groups.filter((group) => group !== current)] : groups
-    }
-    return groups
-      .map((group) => ({ group, score: scorePaletteItem(trimmedQuery, group.title, [group.localPath]) }))
-      .filter((entry) => entry.score > 0)
-      .sort((left, right) => right.score - left.score)
-      .map((entry) => entry.group)
-  }, [page, projectId, sidebarData.projectGroups, trimmedQuery])
-
   // "Chats in <project>" sub-page, empty query: the same grouping as the
   // sidebar's Chats tab (In Progress, Review, date buckets, archived last) —
   // flat headers, no collapsing.
@@ -1120,14 +1106,15 @@ export function CommandPalette({ state }: { state: KannaState }) {
 
   const openInResults = useMemo(() => {
     if (page !== "open-in") return []
-    const items = getOpenAppItems({ editorPreset, isMac, includeFinder: true, includeTerminal: true })
+    const items = getOpenAppItems({ editorPreset, isMac, installedEditors, installedTerminals, includeFinder: true, includeTerminal: true })
+      .filter((item) => item.installed)
     if (!trimmedQuery) return items
     return items
       .map((item) => ({ item, score: scorePaletteItem(trimmedQuery, item.label) }))
       .filter((entry) => entry.score > 0)
       .sort((left, right) => right.score - left.score)
       .map((entry) => entry.item)
-  }, [editorPreset, isMac, page, trimmedQuery])
+  }, [editorPreset, installedEditors, installedTerminals, isMac, page, trimmedQuery])
 
   // ---------------------------------------------------------------------
   // Add Project pages
@@ -1157,8 +1144,8 @@ export function CommandPalette({ state }: { state: KannaState }) {
   }, [page, trimmedQuery])
 
   // All local projects, grouped by recency exactly like the "/" route.
-  const addProjectGroups = useMemo(() => {
-    if (page !== "add-project") return []
+  const localProjectGroups = useMemo(() => {
+    if (page !== "add-project" && page !== "new-thread") return []
     const filtered = filterProjects(state.localProjects?.projects ?? [], trimmedQuery)
     return groupProjectsByRecency(filtered, nowMs)
   }, [nowMs, page, state.localProjects?.projects, trimmedQuery])
@@ -1306,7 +1293,7 @@ export function CommandPalette({ state }: { state: KannaState }) {
       case "open-in":
         return openInResults[0] ? `open-${openInResults[0].value}` : ""
       case "new-thread":
-        if (projectResults[0]) return `project-${projectResults[0].groupKey}`
+        if (localProjectGroups[0]?.projects[0]) return `local-project-${localProjectGroups[0].projects[0].localPath}`
         return !trimmedQuery || scorePaletteItem(trimmedQuery, "Add Project…", ["create", "add", "new"]) > 0
           ? "project-new"
           : ""
@@ -1328,7 +1315,7 @@ export function CommandPalette({ state }: { state: KannaState }) {
       case "add-project": {
         if (addProjectRepo) return "clone-inline"
         if (addProjectActionRows[0]) return `add-action-${addProjectActionRows[0].id}`
-        const firstProject = addProjectGroups[0]?.projects[0]
+        const firstProject = localProjectGroups[0]?.projects[0]
         return firstProject ? `local-project-${firstProject.localPath}` : ""
       }
       case "clone-github":
@@ -1367,7 +1354,7 @@ export function CommandPalette({ state }: { state: KannaState }) {
     return ""
   }, [
     addProjectActionRows,
-    addProjectGroups,
+    localProjectGroups,
     addProjectRepo,
     allProjectSearchResults,
     browseCreateVisible,
@@ -1384,7 +1371,6 @@ export function CommandPalette({ state }: { state: KannaState }) {
     projectChatResults,
     projectChatSections,
     projectChatsTargetId,
-    projectResults,
     projectSearchResults,
     rankedActions,
     reviewResults,
@@ -1441,12 +1427,17 @@ export function CommandPalette({ state }: { state: KannaState }) {
     }
     if (page === "project-chats" && projectChatsTargetId !== null && projectChatsGroup) {
       map.set("project-chats-new", projectChatsGroup.localPath)
+      map.set("project-chats-copy-path", projectChatsGroup.localPath)
     }
-    for (const group of projectResults) {
-      map.set(`project-${group.groupKey}`, group.localPath)
+    if (page === "new-thread") {
+      for (const group of localProjectGroups) {
+        for (const project of group.projects) {
+          map.set(`local-project-${project.localPath}`, project.localPath)
+        }
+      }
     }
     return map
-  }, [allProjectSearchResults, inProgressResults, page, projectChatResults, projectChatSections, projectChatsGroup, projectChatsTargetId, projectResults, projectSearchResults, reviewResults, threadResults])
+  }, [allProjectSearchResults, inProgressResults, localProjectGroups, page, projectChatResults, projectChatSections, projectChatsGroup, projectChatsTargetId, projectSearchResults, reviewResults, threadResults])
   const footerCopyPath = selectedValue ? copyPathByValue.get(selectedValue) : undefined
   // Browse pages swap the copy-path footer for the "⌘↵ Open <highlighted>" button.
   const footerBrowseTarget = page === "browse" && selectedValue ? browseOpenTargets.get(selectedValue) : undefined
@@ -1767,31 +1758,51 @@ export function CommandPalette({ state }: { state: KannaState }) {
           ) : null}
 
           {page === "new-thread" ? (
-            <CommandGroup heading="New Chat In">
-              {projectResults.map((group) => (
-                <CommandItem
-                  key={group.groupKey}
-                  value={`project-${group.groupKey}`}
-                  onSelect={() => {
-                    close()
-                    void state.handleCreateChat(group.groupKey)
-                  }}
-                >
-                  <Folder className={ICON_CLASS} />
-                  <span className="min-w-0 truncate">{group.title}</span>
-                  <span className="ml-auto max-w-[220px] shrink-0 truncate pl-3 text-xs text-muted-foreground">{formatPathWithTilde(group.localPath)}</span>
-                </CommandItem>
+            <>
+              {localProjectGroups.map((group) => (
+                <CommandGroup key={group.key} heading={group.title}>
+                  {group.projects.map((project) => {
+                    const value = `local-project-${project.localPath}`
+                    const busy = pendingActionValue === value || state.startingLocalPath === project.localPath
+                    return (
+                      <CommandItem
+                        key={project.localPath}
+                        value={value}
+                        onSelect={() => {
+                          void runProjectAction(value, {
+                            mode: "existing",
+                            localPath: project.localPath,
+                            title: getPathBasename(project.localPath),
+                          })
+                        }}
+                      >
+                        <Folder className={ICON_CLASS} />
+                        <span className="min-w-0 truncate">{getPathBasename(project.localPath)}</span>
+                        {busy ? (
+                          <Loader2 className="ml-auto h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+                        ) : (
+                          <span className="ml-auto max-w-[220px] shrink-0 truncate pl-3 text-xs text-muted-foreground">
+                            {formatPathWithTilde(project.localPath)}
+                          </span>
+                        )}
+                      </CommandItem>
+                    )
+                  })}
+                </CommandGroup>
               ))}
               {!trimmedQuery || scorePaletteItem(trimmedQuery, "Add Project…", ["create", "add", "new"]) > 0 ? (
-                <CommandItem
-                  value="project-new"
-                  onSelect={() => pushPage({ page: "add-project" })}
-                >
-                  <Plus className={ICON_CLASS} />
-                  <span>Add Project…</span>
-                </CommandItem>
+                <CommandGroup>
+                  <CommandItem
+                    value="project-new"
+                    onSelect={() => pushPage({ page: "add-project" })}
+                  >
+                    <Plus className={ICON_CLASS} />
+                    <span>Add Project…</span>
+                  </CommandItem>
+                </CommandGroup>
               ) : null}
-            </CommandGroup>
+              {actionError ? <PaletteErrorRow message={actionError} /> : null}
+            </>
           ) : null}
 
           {page === "project-chats" ? (
@@ -1816,6 +1827,21 @@ export function CommandPalette({ state }: { state: KannaState }) {
                       </span>
                     ) : null}
                   </CommandItem>
+                  {projectChatsGroup ? (
+                    <CommandItem
+                      value="project-chats-copy-path"
+                      onSelect={() => {
+                        close()
+                        void state.handleCopyPath(projectChatsGroup.localPath)
+                      }}
+                    >
+                      <Copy className={ICON_CLASS} />
+                      <span>Copy Path</span>
+                      <span className="ml-auto max-w-[220px] shrink-0 truncate pl-3 text-xs text-muted-foreground">
+                        {formatPathWithTilde(projectChatsGroup.localPath)}
+                      </span>
+                    </CommandItem>
+                  ) : null}
                 </CommandGroup>
               ) : null}
               {projectChatSections ? (
@@ -1870,8 +1896,8 @@ export function CommandPalette({ state }: { state: KannaState }) {
                     openAppValue({
                       value: item.value,
                       editorCommandTemplate,
-                      onOpenExternal: (action, editor) => {
-                        void state.handleOpenExternal(action, editor)
+                      onOpenExternal: (action, editor, terminal) => {
+                        void state.handleOpenExternal(action, editor, terminal)
                       },
                     })
                   }}
@@ -1919,7 +1945,7 @@ export function CommandPalette({ state }: { state: KannaState }) {
                   ))}
                 </CommandGroup>
               ) : null}
-              {addProjectGroups.map((group) => (
+              {localProjectGroups.map((group) => (
                 <CommandGroup key={group.key} heading={group.title}>
                   {group.projects.map((project) => {
                     const value = `local-project-${project.localPath}`

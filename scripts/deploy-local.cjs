@@ -23,7 +23,7 @@ execFileSync('bun',['run','check'],{cwd:repo,stdio:'inherit'});
 const root = path.join(repo,'.deploy',`${Date.now()}-${commit.slice(0,8)}`);
 const payload = path.join(root,'payload');
 const manifest = {};
-const files = git('ls-files','src/server','src/shared').split('\n').filter(f=>f && !/\.(test|e2e)\./.test(f));
+const files = ['package.json', ...git('ls-files','src/server','src/shared').split('\n').filter(f=>f && !/\.(test|e2e)\./.test(f))];
 for (const file of files) {
   const dest=path.join(payload,file); fs.mkdirSync(path.dirname(dest),{recursive:true}); fs.copyFileSync(path.join(repo,file),dest);
 }

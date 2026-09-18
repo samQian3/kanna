@@ -9,6 +9,7 @@ import {
   MAX_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES,
   MIN_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES,
 } from "../shared/transcript-window"
+import { getDefaultEditorCommandTemplate, isEditorPreset } from "../shared/editor-presets"
 import { formatDisplayPath } from "./paths"
 import {
   mergeProviderDefaultsPatch,
@@ -20,10 +21,13 @@ import {
   type AppSettingsPatch,
   type AppSettingsSnapshot,
   type AppThemePreference,
+  type ChatBrowserNotificationPreference,
   type ChatSoundId,
   type ChatSoundPreference,
   type DefaultProviderPreference,
   type EditorPreset,
+  type SubmitWhileRunning,
+  type TerminalPreset,
 } from "../shared/types"
 
 interface AppSettingsFile {
@@ -33,6 +37,8 @@ interface AppSettingsFile {
   theme?: unknown
   chatSoundPreference?: unknown
   chatSoundId?: unknown
+  chatBrowserNotificationPreference?: unknown
+  submitWhileRunning?: unknown
   terminal?: {
     scrollbackLines?: unknown
     minColumnWidth?: unknown
@@ -59,9 +65,15 @@ interface AppSettingsFile {
   setupDismissed?: unknown
 }
 
-// devbox is a server-runtime fact (the --cloud flag), not settings state.
-interface AppSettingsState extends Omit<AppSettingsSnapshot, "devbox"> {
+// devbox and the installed-app lists are server-runtime facts, not settings state.
+interface AppSettingsState extends Omit<AppSettingsSnapshot, "devbox" | "installedEditors" | "installedTerminals"> {
   analyticsUserId: string
+}
+
+interface SnapshotExtras {
+  devbox: boolean
+  installedEditors: EditorPreset[] | null
+  installedTerminals: TerminalPreset[] | null
 }
 
 interface NormalizedAppSettings {
@@ -79,24 +91,15 @@ const MAX_TERMINAL_MIN_COLUMN_WIDTH = 900
 const DEFAULT_EDITOR_PRESET: EditorPreset = "cursor"
 const DEFAULT_CHAT_SOUND_PREFERENCE: ChatSoundPreference = "always"
 const DEFAULT_CHAT_SOUND_ID: ChatSoundId = "funk"
+// Off by default: turning it on triggers the browser's permission prompt,
+// which should only ever happen because the user asked for it.
+const DEFAULT_CHAT_BROWSER_NOTIFICATION_PREFERENCE: ChatBrowserNotificationPreference = "never"
+// Queue by default: interrupting a running turn is the rarer, more disruptive
+// intent, so it is the one you reach for deliberately.
+const DEFAULT_SUBMIT_WHILE_RUNNING: SubmitWhileRunning = "queue"
 
 function createAnalyticsUserId() {
   return `anon_${randomUUID()}`
-}
-
-function getDefaultEditorCommandTemplate(preset: EditorPreset) {
-  switch (preset) {
-    case "vscode":
-      return "code {path}"
-    case "xcode":
-      return "xed {path}"
-    case "windsurf":
-      return "windsurf {path}"
-    case "custom":
-    case "cursor":
-    default:
-      return "cursor {path}"
-  }
 }
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number) {
@@ -130,6 +133,16 @@ function normalizeChatSoundId(value: unknown): ChatSoundId {
   }
 }
 
+function normalizeChatBrowserNotificationPreference(value: unknown): ChatBrowserNotificationPreference {
+  return value === "never" || value === "unfocused" || value === "always"
+    ? value
+    : DEFAULT_CHAT_BROWSER_NOTIFICATION_PREFERENCE
+}
+
+function normalizeSubmitWhileRunning(value: unknown): SubmitWhileRunning {
+  return value === "steer" ? "steer" : DEFAULT_SUBMIT_WHILE_RUNNING
+}
+
 function normalizeDefaultProvider(value: unknown): DefaultProviderPreference {
   return value === "claude" || value === "codex" || value === "cursor" || value === "pi" || value === "last_used"
     ? value
@@ -137,9 +150,7 @@ function normalizeDefaultProvider(value: unknown): DefaultProviderPreference {
 }
 
 function normalizeEditorPreset(value: unknown): EditorPreset {
-  return value === "vscode" || value === "xcode" || value === "windsurf" || value === "custom" || value === "cursor"
-    ? value
-    : DEFAULT_EDITOR_PRESET
+  return isEditorPreset(value) ? value : DEFAULT_EDITOR_PRESET
 }
 
 function normalizeEditorCommandTemplate(value: unknown, preset: EditorPreset) {
@@ -155,6 +166,8 @@ function toFilePayload(state: AppSettingsState) {
     theme: state.theme,
     chatSoundPreference: state.chatSoundPreference,
     chatSoundId: state.chatSoundId,
+    chatBrowserNotificationPreference: state.chatBrowserNotificationPreference,
+    submitWhileRunning: state.submitWhileRunning,
     terminal: state.terminal,
     editor: state.editor,
     transcript: state.transcript,
@@ -168,14 +181,21 @@ function toFilePayload(state: AppSettingsState) {
   }
 }
 
-function toSnapshot(state: AppSettingsState, devbox = false): AppSettingsSnapshot {
+function toSnapshot(
+  state: AppSettingsState,
+  extras: SnapshotExtras = { devbox: false, installedEditors: null, installedTerminals: null }
+): AppSettingsSnapshot {
   return {
-    devbox,
+    devbox: extras.devbox,
+    installedEditors: extras.installedEditors,
+    installedTerminals: extras.installedTerminals,
     analyticsEnabled: state.analyticsEnabled,
     browserSettingsMigrated: state.browserSettingsMigrated,
     theme: state.theme,
     chatSoundPreference: state.chatSoundPreference,
     chatSoundId: state.chatSoundId,
+    chatBrowserNotificationPreference: state.chatBrowserNotificationPreference,
+    submitWhileRunning: state.submitWhileRunning,
     terminal: state.terminal,
     editor: state.editor,
     transcript: state.transcript,
@@ -242,6 +262,8 @@ function normalizeAppSettings(
     theme: normalizeTheme(source?.theme),
     chatSoundPreference: normalizeChatSoundPreference(source?.chatSoundPreference),
     chatSoundId: normalizeChatSoundId(source?.chatSoundId),
+    chatBrowserNotificationPreference: normalizeChatBrowserNotificationPreference(source?.chatBrowserNotificationPreference),
+    submitWhileRunning: normalizeSubmitWhileRunning(source?.submitWhileRunning),
     terminal: {
       scrollbackLines: clampNumber(source?.terminal?.scrollbackLines, DEFAULT_TERMINAL_SCROLLBACK, MIN_TERMINAL_SCROLLBACK, MAX_TERMINAL_SCROLLBACK),
       minColumnWidth: clampNumber(source?.terminal?.minColumnWidth, DEFAULT_TERMINAL_MIN_COLUMN_WIDTH, MIN_TERMINAL_MIN_COLUMN_WIDTH, MAX_TERMINAL_MIN_COLUMN_WIDTH),
@@ -292,6 +314,8 @@ function toComparablePayload(source: AppSettingsFile) {
     theme: source.theme,
     chatSoundPreference: source.chatSoundPreference,
     chatSoundId: source.chatSoundId,
+    chatBrowserNotificationPreference: source.chatBrowserNotificationPreference,
+    submitWhileRunning: source.submitWhileRunning,
     terminal: source.terminal,
     editor: source.editor,
     transcript: source.transcript,
@@ -359,12 +383,12 @@ export class AppSettingsManager {
   private state: AppSettingsState
   private readonly listeners = new Set<(snapshot: AppSettingsSnapshot) => void>()
   /** Server-computed snapshot fields — never read from or written to the file. */
-  private readonly extras: { devbox: boolean }
+  private extras: SnapshotExtras
 
   constructor(filePath = getSettingsFilePath(homedir()), extras: { devbox?: boolean } = {}) {
     this.filePath = filePath
     this.state = normalizeAppSettings(undefined, filePath).payload
-    this.extras = { devbox: extras.devbox === true }
+    this.extras = { devbox: extras.devbox === true, installedEditors: null, installedTerminals: null }
   }
 
   async initialize() {
@@ -380,7 +404,29 @@ export class AppSettingsManager {
   }
 
   getSnapshot() {
-    return toSnapshot(this.state, this.extras.devbox)
+    return toSnapshot(this.state, this.extras)
+  }
+
+  /**
+   * Publish the editor-detection result. Notifies like any other change, so
+   * the menus ungrey themselves as soon as the probe lands; the snapshot
+   * dedupe upstream drops the push when the list is unchanged.
+   */
+  setInstalledEditors(installedEditors: EditorPreset[]) {
+    this.publishExtras({ installedEditors })
+  }
+
+  /** Publish the terminal-detection result; same shape as the editor one. */
+  setInstalledTerminals(installedTerminals: TerminalPreset[]) {
+    this.publishExtras({ installedTerminals })
+  }
+
+  private publishExtras(patch: Partial<SnapshotExtras>) {
+    this.extras = { ...this.extras, ...patch }
+    const snapshot = this.getSnapshot()
+    for (const listener of this.listeners) {
+      listener(snapshot)
+    }
   }
 
   getState() {
@@ -412,7 +458,7 @@ export class AppSettingsManager {
     await mkdir(path.dirname(this.filePath), { recursive: true })
     await writeFile(this.filePath, `${JSON.stringify(toFilePayload(nextState), null, 2)}\n`, "utf8")
     this.setState(nextState)
-    return toSnapshot(nextState, this.extras.devbox)
+    return toSnapshot(nextState, this.extras)
   }
 
   private async readState(options?: { persistNormalized?: boolean }) {
@@ -447,7 +493,7 @@ export class AppSettingsManager {
 
   private setState(state: AppSettingsState) {
     this.state = state
-    const snapshot = toSnapshot(state, this.extras.devbox)
+    const snapshot = toSnapshot(state, this.extras)
     for (const listener of this.listeners) {
       listener(snapshot)
     }

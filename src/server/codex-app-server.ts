@@ -22,7 +22,6 @@ import {
   type CollabAgentToolCallItem,
   type ContextCompactedNotification,
   type CodexError,
-  type ErrorNotification,
   type CodexModelSummary,
   type CodexRateLimitSnapshot,
   type CodexRequestId,
@@ -34,6 +33,7 @@ import {
   type CommandExecutionRequestApprovalResponse,
   type DynamicToolCallOutputContentItem,
   type DynamicToolCallResponse,
+  type ErrorNotification,
   type FileChangeApprovalDecision,
   type FileChangeRequestApprovalParams,
   type FileChangeRequestApprovalResponse,
@@ -92,7 +92,6 @@ interface PendingRequest<TResult> {
 }
 
 interface PendingTurn {
-  retryCause: CodexError | null
   subagentStates?: Map<string,ChildState>
   turnId: string | null
   model: string
@@ -106,6 +105,13 @@ interface PendingTurn {
   planTextByItemId: Map<string, string>
   todoSequence: number
   pendingWebSearchResultToolId: string | null
+  /**
+   * Most informative error from this turn's retry sequence, if it had one.
+   * Kept so a turn that ends up failing can still name the problem — codex
+   * reports the cause once, somewhere in the sequence, and the terminal
+   * notification that follows can be empty.
+   */
+  retryCause: CodexError | null
   resolved: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: (
@@ -187,6 +193,12 @@ function errorMessage(value: unknown): string {
   return String(value)
 }
 
+/**
+ * The cause as one readable token. String variants pass through; object
+ * variants name their single key and, when the upstream sent one, the HTTP
+ * status ("responseStreamDisconnected (HTTP 502)"). Without this the exact
+ * errors a retry sequence is about would read as having no cause at all.
+ */
 function errorDetail(error: CodexError): string {
   const info = error.codexErrorInfo
   if (typeof info === "string") return info.trim()
@@ -996,8 +1008,8 @@ export class CodexAppServerManager {
       planTextByItemId: new Map(),
       todoSequence: 0,
       pendingWebSearchResultToolId: null,
-      resolved: false,
       retryCause: null,
+      resolved: false,
       onToolRequest: args.onToolRequest,
       onApprovalRequest: args.onApprovalRequest,
     }
@@ -1136,7 +1148,7 @@ export class CodexAppServerManager {
   stopSession(chatId: string) {
     const context = this.sessions.get(chatId)
     if (!context) return
-    context.closed = true
+    this.failContext(context, "Codex session closed")
     context.pendingTurn?.queue.finish()
     this.sessions.delete(chatId)
     try {
@@ -1187,7 +1199,7 @@ export class CodexAppServerManager {
     void (async () => {
       for await (const line of stderr) {
         if (line.trim()) {
-          context.stderrLines.push(line.trim())
+          context.stderrLines = [line.trim().slice(-8192)]
         }
       }
     })()
@@ -1627,7 +1639,9 @@ export class CodexAppServerManager {
         isError,
         durationMs: 0,
         result: isError
-          ? formatCodexError(notification.turn.error) || formatCodexError(pendingTurn.retryCause) || "Codex turn failed"
+          ? formatCodexError(notification.turn.error)
+            || formatCodexError(pendingTurn.retryCause)
+            || "Codex turn failed"
           : formatCodexError(notification.turn.error),
       }),
     })
@@ -1635,6 +1649,16 @@ export class CodexAppServerManager {
     context.pendingTurn = null
   }
 
+  /**
+   * codex reports two different things through `error`. A dropped model stream
+   * arrives with `willRetry: true` and a message that is only a progress
+   * counter ("Reconnecting... 2/5") — the turn is still alive and codex retries
+   * on its own. Failing here killed turns that would have recovered a second
+   * later, and reported the counter as the outcome, which says nothing about
+   * what went wrong. Show it as a status line instead (the transcript renders
+   * only the last one, so it clears itself when the stream comes back) and let
+   * the turn run. Only `willRetry: false` is terminal.
+   */
   private handleErrorNotification(context: SessionContext, notification: ErrorNotification) {
     const message = formatCodexError(notification.error) || "Codex reported an error"
     if (!notification.willRetry) {
@@ -1673,6 +1697,15 @@ export class CodexAppServerManager {
     }
     context.pendingRequests.clear()
     context.closed = true
+    if (this.sessions.get(context.chatId) === context) this.sessions.delete(context.chatId)
+  }
+
+  getResourceCounts() {
+    return {
+      codexSessions: this.sessions.size,
+      codexPendingRequests: [...this.sessions.values()].reduce((sum, session) => sum + session.pendingRequests.size, 0),
+      codexStderrChars: [...this.sessions.values()].reduce((sum, session) => sum + session.stderrLines.reduce((total, line) => total + line.length, 0), 0),
+    }
   }
 
   private async sendRequest<TResult>(context: SessionContext, method: string, params: unknown): Promise<TResult> {

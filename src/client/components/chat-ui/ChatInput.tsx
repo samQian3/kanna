@@ -22,12 +22,14 @@ import { useVoiceRecorder } from "../../hooks/useVoiceRecorder"
 import { RecordingWaveform } from "./RecordingWaveform"
 import { useShallow } from "zustand/react/shallow"
 import { useChatInputStore } from "../../stores/chatInputStore"
-import { type ComposerState, useChatPreferencesStore } from "../../stores/chatPreferencesStore"
+import { NEW_CHAT_COMPOSER_ID, type ComposerState, useChatPreferencesStore } from "../../stores/chatPreferencesStore"
 import { CHAT_INPUT_ATTRIBUTE, focusNextChatInput, REQUEST_ATTACH_FILES_EVENT } from "../../app/chatFocusPolicy"
 import { abbreviatePathHead, formatPathWithTilde } from "../../lib/pathUtils"
 import { copyTextToClipboard } from "../../lib/clipboard"
 import { buildUploadErrorReport, simpleUploadError, type UploadErrorReport } from "../../lib/uploadError"
 import { useUnauthenticatedHarnesses } from "../../stores/providerAuthStore"
+import { useAppSettingsStore } from "../../stores/appSettingsStore"
+import { shouldSteerSubmit } from "../../../shared/submit-mode"
 import { SignInDialog } from "../auth/SignInDialog"
 import { ChatPreferenceControls } from "./ChatPreferenceControls"
 import { ContextWindowMeter } from "./ContextWindowMeter"
@@ -169,7 +171,7 @@ interface ComposerAttachment extends ChatAttachment {
 interface Props {
   onSubmit: (
     value: string,
-    options?: { provider?: AgentProvider; model?: string; modelOptions?: ModelOptions; planMode?: boolean; autoPlan?: boolean; attachments?: ChatAttachment[] }
+    options?: { provider?: AgentProvider; model?: string; modelOptions?: ModelOptions; planMode?: boolean; autoPlan?: boolean; attachments?: ChatAttachment[]; steer?: boolean }
   ) => Promise<void>
   onLayoutChange?: () => void
   onCancel?: () => void
@@ -247,6 +249,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const { composerChatId, providerSwitchPending, selectedProvider } = composer
   const providerPrefs = composer.effectiveState
   const showModePicker = composer.supportsPlanMode
+  // What Enter does while a turn is running; ⌘/Ctrl+Enter does the other.
+  const submitWhileRunning = useAppSettingsStore((store) => store.settings?.submitWhileRunning) ?? "queue"
   // Switching to a harness that isn't signed in is blocked: the pick is
   // stashed here, a sign-in dialog opens, and the switch applies
   // automatically once the auth store reports the service signed in.
@@ -477,8 +481,13 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     setValue((current) => (current === "" ? current : ""))
   }, [chatId, storedDraft])
 
+  // Only the new-chat composer gets an eager entry. An existing chat is left
+  // without one until the user changes something, so its state keeps deriving
+  // from what the server says it last ran with (useComposer's seed) rather
+  // than being pinned to whatever the defaults were at mount — which, after a
+  // reload, silently moved every chat onto the default model.
   useEffect(() => {
-    initializeComposerForChat(composerChatId)
+    if (composerChatId === NEW_CHAT_COMPOSER_ID) initializeComposerForChat(composerChatId)
   }, [composerChatId, initializeComposerForChat])
 
   useEffect(() => {
@@ -543,6 +552,9 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (!file) break
 
       activeUploadsRef.current += 1
+      // Not crypto.randomUUID(): that is secure-context only, so it is
+      // undefined when Kanna is opened over plain http on a LAN/Tailscale
+      // hostname, and every upload would throw before it started.
       const tempId = generateUUID()
       const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined
       const generation = uploadGenerationRef.current
@@ -687,7 +699,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, [])
 
   /** The composer's current prefs, the way a send carries them. */
-  function buildSubmitOptions(attachmentsForSubmit: ChatAttachment[]) {
+  function buildSubmitOptions(attachmentsForSubmit: ChatAttachment[], steer = shouldSteerSubmit(submitWhileRunning, false)) {
     let modelOptions: ModelOptions
     if (providerPrefs.provider === "claude") {
       modelOptions = { claude: { ...providerPrefs.modelOptions } }
@@ -699,6 +711,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       modelOptions = { codex: { ...providerPrefs.modelOptions } }
     }
     return {
+      steer,
       provider: selectedProvider,
       model: providerPrefs.model,
       modelOptions,
@@ -708,7 +721,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     }
   }
 
-  async function handleSubmit() {
+  async function handleSubmit(options?: { withModifier?: boolean }) {
     if (!canSubmit || hasPendingUploads) return
 
     const nextValue = value
@@ -716,7 +729,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const previousSelectedAttachmentId = selectedAttachmentId
     const previousUploadError = uploadError
     const attachmentsForSubmit = uploadedAttachments.map(({ previewUrl: _previewUrl, status: _status, ...attachment }) => attachment)
-    const submitOptions = buildSubmitOptions(attachmentsForSubmit)
+    const submitOptions = buildSubmitOptions(
+      attachmentsForSubmit,
+      shouldSteerSubmit(submitWhileRunning, options?.withModifier === true)
+    )
     setValue("")
     if (chatId) clearDraft(chatId)
     if (textareaRef.current) textareaRef.current.style.height = "auto"
@@ -836,7 +852,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const isTouchDevice = "ontouchstart" in window || navigator.maxTouchPoints > 0
     if (event.key === "Enter" && !event.shiftKey && !isTouchDevice && !disabled && canSubmit && !hasPendingUploads) {
       event.preventDefault()
-      void handleSubmit()
+      void handleSubmit({ withModifier: event.metaKey || event.ctrlKey })
     }
   }
 
@@ -1088,7 +1104,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 // cancel, so a file-only message queues instead of stopping
                 // the running turn.
                 if (!disabled && canSubmit && !hasPendingUploads) {
-                  void handleSubmit()
+                  void handleSubmit({ withModifier: event.metaKey || event.ctrlKey })
                 } else if (canCancel) {
                   onCancel?.()
                 }

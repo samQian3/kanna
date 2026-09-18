@@ -21,6 +21,8 @@ async function createTempFilePath() {
 function expectedSettingsSnapshot(filePath: string, overrides: Partial<AppSettingsSnapshot> = {}): AppSettingsSnapshot {
   return {
     devbox: false,
+    installedTerminals: null,
+    installedEditors: null,
     analyticsEnabled: true,
     browserSettingsMigrated: false,
     setupShown: false,
@@ -29,6 +31,8 @@ function expectedSettingsSnapshot(filePath: string, overrides: Partial<AppSettin
     theme: "system",
     chatSoundPreference: "always",
     chatSoundId: "funk",
+    chatBrowserNotificationPreference: "never",
+    submitWhileRunning: "queue",
     terminal: {
       scrollbackLines: 1_000,
       minColumnWidth: 450,
@@ -250,6 +254,7 @@ describe("AppSettingsManager", () => {
     const snapshot = await manager.writePatch({
       theme: "dark",
       chatSoundId: "glass",
+      chatBrowserNotificationPreference: "unfocused",
       terminal: { scrollbackLines: 2_500 },
       editor: { preset: "vscode" },
       providerDefaults: {
@@ -262,6 +267,7 @@ describe("AppSettingsManager", () => {
       analyticsUserId: string
       theme: string
       chatSoundId: string
+      chatBrowserNotificationPreference: string
       terminal: { scrollbackLines: number; minColumnWidth: number }
       editor: { preset: string; commandTemplate: string }
       providerDefaults: { codex: { modelOptions: { fastMode: boolean } } }
@@ -269,6 +275,7 @@ describe("AppSettingsManager", () => {
 
     expect(snapshot.theme).toBe("dark")
     expect(snapshot.chatSoundId).toBe("glass")
+    expect(snapshot.chatBrowserNotificationPreference).toBe("unfocused")
     expect(snapshot.terminal.scrollbackLines).toBe(2_500)
     expect(snapshot.terminal.minColumnWidth).toBe(450)
     expect(snapshot.editor.preset).toBe("vscode")
@@ -277,8 +284,46 @@ describe("AppSettingsManager", () => {
     expect(nextPayload.analyticsUserId).toBe(initialPayload.analyticsUserId)
     expect(nextPayload.theme).toBe("dark")
     expect(nextPayload.chatSoundId).toBe("glass")
+    expect(nextPayload.chatBrowserNotificationPreference).toBe("unfocused")
 
     manager.dispose()
+  })
+
+  test("persists the composer's queue-or-steer default, and ignores junk", async () => {
+    const filePath = await createTempFilePath()
+    const manager = new AppSettingsManager(filePath)
+    await manager.initialize()
+
+    expect(manager.getSnapshot().submitWhileRunning).toBe("queue")
+    expect((await manager.writePatch({ submitWhileRunning: "steer" })).submitWhileRunning).toBe("steer")
+
+    const payload = JSON.parse(await readFile(filePath, "utf8")) as { submitWhileRunning: string }
+    expect(payload.submitWhileRunning).toBe("steer")
+
+    // Anything unrecognised falls back to queueing rather than to the more
+    // disruptive action.
+    await writeFile(filePath, JSON.stringify({ submitWhileRunning: "yolo" }), "utf8")
+    await manager.reload()
+    expect(manager.getSnapshot().submitWhileRunning).toBe("queue")
+
+    manager.dispose()
+  })
+
+  test("does not rewrite a settings file that already carries the composer default", async () => {
+    // Every field the file payload has must be in the comparison too, or the
+    // file is rewritten on every launch for no change.
+    const filePath = await createTempFilePath()
+    const first = new AppSettingsManager(filePath)
+    await first.initialize()
+    await first.writePatch({ submitWhileRunning: "steer" })
+    first.dispose()
+    const written = await readFile(filePath, "utf8")
+
+    const second = new AppSettingsManager(filePath)
+    await second.initialize()
+    second.dispose()
+
+    expect(await readFile(filePath, "utf8")).toBe(written)
   })
 
   test("normalizes GPT-5.6 reasoning levels when settings are written", async () => {

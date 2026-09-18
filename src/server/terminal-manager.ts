@@ -98,6 +98,8 @@ export class TerminalOutputLog {
     return this.version
   }
 
+  get retainedCharacters() { return this.retained }
+
   /** Exposed for tests: how many segments are held. */
   get segmentCount() {
     return this.chunks.length
@@ -185,6 +187,12 @@ function createTerminalEnv() {
     ...process.env,
     TERM: "xterm-256color",
     COLORTERM: "truecolor",
+    // Lets a shell rc tell "running inside Kanna" from a normal terminal, the
+    // way VS Code's TERM_PROGRAM=vscode does. The one lever a user has for a
+    // setup this terminal can't host — an rc that execs into another shell,
+    // say — is to condition on it.
+    TERM_PROGRAM: "kanna",
+    KANNA_TERMINAL: "1",
   })
 }
 
@@ -255,6 +263,15 @@ function signalTerminalProcessGroup(subprocess: Bun.Subprocess | null, signal: N
 export class TerminalManager {
   private readonly sessions = new Map<string, TerminalSession>()
   private readonly listeners = new Set<(event: TerminalEvent) => void>()
+
+  getResourceCounts() {
+    const sessions = [...this.sessions.values()]
+    return {
+      terminalSessions: sessions.length,
+      runningTerminals: sessions.filter(session => session.status === "running").length,
+      terminalOutputCharacters: sessions.reduce((sum, session) => sum + session.output.retainedCharacters, 0),
+    }
+  }
 
   onEvent(listener: (event: TerminalEvent) => void) {
     this.listeners.add(listener)

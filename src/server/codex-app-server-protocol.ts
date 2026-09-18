@@ -186,6 +186,12 @@ export interface ThreadStartResponse {
 export type ThreadResumeResponse = ThreadStartResponse
 export type ThreadForkResponse = ThreadStartResponse
 
+/**
+ * `codexErrorInfo` is a serde externally-tagged enum. Causes without data
+ * arrive as a bare string (`"usageLimitExceeded"`); the HTTP family arrives as
+ * a one-key object (`{ responseStreamDisconnected: { httpStatusCode: 502 } }`).
+ * The object form is the stream-drop family that `willRetry` retries cover.
+ */
 export type CodexErrorInfo = string | Record<string, { httpStatusCode?: number | null } | null | undefined>
 
 /**

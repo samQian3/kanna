@@ -77,6 +77,8 @@ const DEFAULT_KEYBINDINGS_SNAPSHOT: KeybindingsSnapshot = {
 
 const DEFAULT_APP_SETTINGS_SNAPSHOT: AppSettingsSnapshot = {
   devbox: false,
+  installedTerminals: null,
+  installedEditors: null,
   analyticsEnabled: true,
   browserSettingsMigrated: false,
   setupShown: false,
@@ -85,6 +87,8 @@ const DEFAULT_APP_SETTINGS_SNAPSHOT: AppSettingsSnapshot = {
   theme: "system",
   chatSoundPreference: "always",
   chatSoundId: "funk",
+  chatBrowserNotificationPreference: "never",
+  submitWhileRunning: "queue",
   terminal: {
     scrollbackLines: 1_000,
     minColumnWidth: 450,
@@ -588,6 +592,7 @@ describe("ws-router", () => {
             theme: patch.theme ?? snapshot.theme,
             chatSoundPreference: patch.chatSoundPreference ?? snapshot.chatSoundPreference,
             chatSoundId: patch.chatSoundId ?? snapshot.chatSoundId,
+            chatBrowserNotificationPreference: patch.chatBrowserNotificationPreference ?? snapshot.chatBrowserNotificationPreference,
             defaultProvider: patch.defaultProvider ?? snapshot.defaultProvider,
             terminal: { ...snapshot.terminal, ...patch.terminal },
             editor: { ...snapshot.editor, ...patch.editor },
