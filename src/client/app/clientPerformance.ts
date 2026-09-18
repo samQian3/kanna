@@ -1,3 +1,4 @@
+import { generateUUID } from "../lib/utils"
 import { CLIENT_PERFORMANCE_METRICS, type ClientPerformanceMetric } from "../../shared/performance"
 
 const metrics = new Map<ClientPerformanceMetric, { count: number; total: number; max: number }>()
@@ -13,7 +14,7 @@ export function recordClientPerformance(name: ClientPerformanceMetric, value: nu
 
 /** Summaries contain counts and durations. Chat text and IDs never enter this log. */
 export function startClientPerformance(sample: () => Partial<Record<ClientPerformanceMetric, number>>) {
-  const clientId = crypto.randomUUID()
+  const clientId = generateUUID()
   let observer: PerformanceObserver | null = null
   try {
     if (typeof PerformanceObserver !== "undefined" && PerformanceObserver.supportedEntryTypes.includes("longtask")) {
